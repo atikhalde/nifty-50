@@ -1,0 +1,463 @@
+// =====================================================================================
+//  BSL / SSL LIQUIDITY START SIGNALS — v5 LITE
+//  ---------------------------------------------------------------------------------
+//  Stripped-down build of the NIFTY Liquidity & Bias Engine. EVERYTHING except the
+//  buy-side / sell-side liquidity pools was removed: no pivots, no CPR, no S/R zones,
+//  no HTF module, no sector breadth, no A/D, no VIX, no dashboard — and therefore
+//  ZERO request.security() calls (fast, and works on any symbol/timeframe).
+//
+//  WHAT IT DOES
+//   * Confirmed swing HIGH opens a BUY-SIDE liquidity pool (BSL) above price — the
+//     shorts' stop cluster. Equal highs merge into one EQH pool and share a touch
+//     count. Confirmed swing LOW opens a SELL-SIDE pool (SSL) below — longs' stops.
+//   * Pools live until swept or expired. A sweep = price trades through the level and
+//     closes back inside (BSL sweep → bearish marker, SSL sweep → bullish marker).
+//     Swept pools stay on chart and get an automatic performance score in R.
+//   * START-POINT ENTRY SIGNALS: the moment a FRESH pool is created, its start point
+//     is marked with a BUY / SELL label anchored at the actual swing bar.
+//     DEFAULT mapping (fade the fresh swing):  new BSL → SELL  ·  new SSL → BUY
+//     Alternative "magnet" mapping (via input): new BSL → BUY (drawn up to the pool)
+//                                               new SSL → SELL (drawn down to it)
+//     NOTE on timing: a swing can only be confirmed `pivLen` bars after the actual
+//     high/low, so the signal FIRES on the confirmation bar (non-repainting) while
+//     the label is drawn back at the true start bar. Equal-high/low merges count as
+//     a touch of an EXISTING pool, not a new start, so they do not fire signals.
+// =====================================================================================
+
+//@version=5
+indicator("BSL / SSL Liquidity Start Signals", shorttitle="BSL/SSL Start", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// =====================================================================================
+//  INPUTS
+// =====================================================================================
+grpL = "① Liquidity Pools"
+showLiq       = input.bool(true,  "Enable liquidity engine",   group=grpL, tooltip="Master switch. Entry signals are generated when a NEW pool starts, so they require this ON.")
+pivLen        = input.int(8,      "Swing pivot strength",      minval=2, maxval=50, group=grpL, tooltip="Bars left + right needed to confirm a swing. Signals fire this many bars after the actual high/low — the unavoidable cost of not repainting.")
+zoneAtrMult   = input.float(0.25, "Zone thickness (× ATR)",    minval=0.05, maxval=2.0, step=0.05, group=grpL)
+eqTolAtr      = input.float(0.15, "Equal H/L tolerance (× ATR)", minval=0.02, maxval=1.0, step=0.01, group=grpL)
+maxPools      = input.int(12,     "Max live pools per side",   minval=2, maxval=30, group=grpL)
+poolExpiry    = input.int(300,    "Pool expiry (bars)",        minval=20, maxval=2000, group=grpL)
+showSwept     = input.bool(true,  "Keep swept pools on chart", group=grpL)
+
+grpN = "② Zone Labels"
+showZoneLbl   = input.bool(true,  "Name every zone",           group=grpN)
+lblMode       = input.string("Full", "Label detail", options=["Name only","Full"], group=grpN, tooltip="Name only = BSL-07. Full = BSL-07 ×3 ★★★.")
+lblSize       = input.string("Tiny", "Label size", options=["Tiny","Small","Normal"], group=grpN)
+lblOffset     = input.int(14,     "Label offset (bars right)", minval=0, maxval=60, group=grpN)
+
+grpA = "③ Sweep Audit"
+auditOn       = input.bool(true,  "Score zones after sweep (in R)", group=grpA, tooltip="After a sweep, waits N bars and appends the best move achieved, measured in ATR (R). This is how you find which zone types actually work.")
+auditBars     = input.int(12,     "Audit window (bars)",       minval=3, maxval=100, group=grpA)
+maxHist       = input.int(40,     "Max swept zones kept",      minval=5, maxval=200, group=grpA)
+
+grpS = "④ Start-Point Entry Signals"
+showSignals   = input.bool(true,  "Show BUY / SELL on new pools", group=grpS)
+sigDir        = input.string("BSL→SELL · SSL→BUY", "Signal direction", options=["BSL→SELL · SSL→BUY","BSL→BUY · SSL→SELL"], group=grpS, tooltip="BSL→SELL · SSL→BUY (default) fades the fresh swing: a new BSL above → SELL, a new SSL below → BUY. BSL→BUY · SSL→SELL is magnet logic: trade toward the fresh pool instead.")
+atrSL         = input.float(1.2,  "Stop loss (× ATR)",         minval=0.2, step=0.1, group=grpS)
+rrTarget      = input.float(2.0,  "Reward:Risk target",        minval=0.5, step=0.5, group=grpS)
+
+grpU = "⑤ Colours"
+colBuy        = input.color(color.new(#089981, 0),  "Bullish",       inline="c1", group=grpU)
+colSell       = input.color(color.new(#f23645, 0),  "Bearish",       inline="c1", group=grpU)
+colBSL        = input.color(color.new(#f23645, 80), "Buy-side liq",  inline="c2", group=grpU)
+colSSL        = input.color(color.new(#089981, 80), "Sell-side liq", inline="c2", group=grpU)
+
+// =====================================================================================
+//  CORE
+// =====================================================================================
+atr        = ta.atr(14)
+zoneH      = atr * zoneAtrMult
+eqTol      = atr * eqTolAtr
+
+f_stars(int n) => n >= 5 ? "★★★★★" : n >= 4 ? "★★★★" : n >= 3 ? "★★★" : n >= 2 ? "★★" : "★"
+zoneLblSize = lblSize == "Tiny" ? size.tiny : lblSize == "Small" ? size.small : size.normal
+
+f_zoneName(bool eq, bool buyside, int id) =>
+    (eq ? (buyside ? "EQH" : "EQL") : (buyside ? "BSL" : "SSL")) + "-" + (id < 10 ? "0" : "") + str.tostring(id)
+
+f_zoneText(string nm, int tch, int strn) =>
+    lblMode == "Name only" ? nm : nm + " ×" + str.tostring(tch) + " " + f_stars(strn)
+
+// strength 1-5: base 1, +1 equal H/L, +1 two+ touches, +1 four+ touches
+f_strength(bool eq, int tch) =>
+    v = 1 + (eq ? 1 : 0) + (tch >= 2 ? 1 : 0) + (tch >= 4 ? 1 : 0)
+    v > 5 ? 5 : v
+
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low,  pivLen, pivLen)
+
+// =====================================================================================
+//  POOL STORAGE
+// =====================================================================================
+var float[] bLvl  = array.new_float()
+var int[]   bBar  = array.new_int()
+var int[]   bTch  = array.new_int()
+var bool[]  bEq   = array.new_bool()
+var box[]   bBox  = array.new_box()
+var label[] bLbl  = array.new_label()
+var int[]   bId   = array.new_int()
+var int[]   bLast = array.new_int()
+var int[]   bStr  = array.new_int()
+
+var float[] sLvl  = array.new_float()
+var int[]   sBar  = array.new_int()
+var int[]   sTch  = array.new_int()
+var bool[]  sEq   = array.new_bool()
+var box[]   sBox  = array.new_box()
+var label[] sLbl  = array.new_label()
+var int[]   sId   = array.new_int()
+var int[]   sLast = array.new_int()
+var int[]   sStr  = array.new_int()
+
+var int bSeq = 0
+var int sSeq = 0
+
+// swept-zone audit history
+var label[]  hLbl  = array.new_label()
+var int[]    hBar  = array.new_int()
+var float[]  hPx   = array.new_float()
+var int[]    hDir  = array.new_int()
+var bool[]   hDone = array.new_bool()
+var string[] hNm   = array.new_string()
+
+// start-point flags (set the moment a FRESH pool is created this bar)
+bool   bslStart  = false
+float  newBSLlvl = na
+string newBSLnm  = ""
+bool   sslStart  = false
+float  newSSLlvl = na
+string newSSLnm  = ""
+
+// =====================================================================================
+//  CREATE BUY-SIDE POOL  (fresh swing high = START POINT)
+// =====================================================================================
+if showLiq and not na(ph)
+    lvl  = ph
+    pbar = bar_index - pivLen
+    isEq = false
+    if array.size(bLvl) > 0
+        for i = array.size(bLvl) - 1 to 0
+            if math.abs(array.get(bLvl, i) - lvl) <= eqTol
+                isEq := true
+                array.set(bEq, i, true)
+                array.set(bTch, i, array.get(bTch, i) + 1)
+                st = f_strength(true, array.get(bTch, i))
+                array.set(bStr, i, st)
+                box.set_bgcolor(array.get(bBox, i), color.new(colBSL, 62))
+                box.set_border_color(array.get(bBox, i), colSell)
+                if showZoneLbl
+                    label.set_text(array.get(bLbl, i), f_zoneText(f_zoneName(true, true, array.get(bId, i)), array.get(bTch, i), st))
+                    label.set_textcolor(array.get(bLbl, i), colSell)
+                break
+    if not isEq
+        bSeq += 1
+        st = f_strength(false, 1)
+        nb = box.new(pbar, lvl + zoneH * 0.5, bar_index + lblOffset, lvl - zoneH * 0.5, border_color=color.new(colSell, 45), border_width=1, bgcolor=colBSL)
+        nl = label.new(bar_index + lblOffset, lvl, showZoneLbl ? f_zoneText(f_zoneName(false, true, bSeq), 1, st) : "", style=label.style_label_left, color=color.new(color.black, 100), textcolor=color.new(colSell, 15), size=zoneLblSize)
+        array.push(bLvl, lvl)
+        array.push(bBar, pbar)
+        array.push(bTch, 1)
+        array.push(bEq, false)
+        array.push(bBox, nb)
+        array.push(bLbl, nl)
+        array.push(bId, bSeq)
+        array.push(bLast, bar_index)
+        array.push(bStr, st)
+        bslStart  := true
+        newBSLlvl := lvl
+        newBSLnm  := f_zoneName(false, true, bSeq)
+        while array.size(bLvl) > maxPools
+            box.delete(array.shift(bBox))
+            label.delete(array.shift(bLbl))
+            array.shift(bLvl)
+            array.shift(bBar)
+            array.shift(bTch)
+            array.shift(bEq)
+            array.shift(bId)
+            array.shift(bLast)
+            array.shift(bStr)
+
+// =====================================================================================
+//  CREATE SELL-SIDE POOL  (fresh swing low = START POINT)
+// =====================================================================================
+if showLiq and not na(pl)
+    lvl  = pl
+    pbar = bar_index - pivLen
+    isEq = false
+    if array.size(sLvl) > 0
+        for i = array.size(sLvl) - 1 to 0
+            if math.abs(array.get(sLvl, i) - lvl) <= eqTol
+                isEq := true
+                array.set(sEq, i, true)
+                array.set(sTch, i, array.get(sTch, i) + 1)
+                st = f_strength(true, array.get(sTch, i))
+                array.set(sStr, i, st)
+                box.set_bgcolor(array.get(sBox, i), color.new(colSSL, 62))
+                box.set_border_color(array.get(sBox, i), colBuy)
+                if showZoneLbl
+                    label.set_text(array.get(sLbl, i), f_zoneText(f_zoneName(true, false, array.get(sId, i)), array.get(sTch, i), st))
+                    label.set_textcolor(array.get(sLbl, i), colBuy)
+                break
+    if not isEq
+        sSeq += 1
+        st = f_strength(false, 1)
+        nb = box.new(pbar, lvl + zoneH * 0.5, bar_index + lblOffset, lvl - zoneH * 0.5, border_color=color.new(colBuy, 45), border_width=1, bgcolor=colSSL)
+        nl = label.new(bar_index + lblOffset, lvl, showZoneLbl ? f_zoneText(f_zoneName(false, false, sSeq), 1, st) : "", style=label.style_label_left, color=color.new(color.black, 100), textcolor=color.new(colBuy, 15), size=zoneLblSize)
+        array.push(sLvl, lvl)
+        array.push(sBar, pbar)
+        array.push(sTch, 1)
+        array.push(sEq, false)
+        array.push(sBox, nb)
+        array.push(sLbl, nl)
+        array.push(sId, sSeq)
+        array.push(sLast, bar_index)
+        array.push(sStr, st)
+        sslStart  := true
+        newSSLlvl := lvl
+        newSSLnm  := f_zoneName(false, false, sSeq)
+        while array.size(sLvl) > maxPools
+            box.delete(array.shift(sBox))
+            label.delete(array.shift(sLbl))
+            array.shift(sLvl)
+            array.shift(sBar)
+            array.shift(sTch)
+            array.shift(sEq)
+            array.shift(sId)
+            array.shift(sLast)
+            array.shift(sStr)
+
+// =====================================================================================
+//  SWEEP / TOUCH / EXPIRY — BUY-SIDE
+// =====================================================================================
+sweptBSL = false
+bool sweptBSLeq = false
+float sweptBSLlvl = na
+if showLiq and array.size(bLvl) > 0
+    for i = array.size(bLvl) - 1 to 0
+        lvl = array.get(bLvl, i)
+        bb  = array.get(bBox, i)
+        ll  = array.get(bLbl, i)
+        nm  = f_zoneName(array.get(bEq, i), true, array.get(bId, i))
+        box.set_right(bb, bar_index + lblOffset)
+        label.set_x(ll, bar_index + lblOffset)
+        if high > lvl and close < lvl
+            sweptBSL := true
+            sweptBSLlvl := lvl
+            if array.get(bEq, i)
+                sweptBSLeq := true
+            if showSwept
+                box.set_bgcolor(bb, color.new(color.gray, 90))
+                box.set_border_color(bb, color.new(color.gray, 60))
+                box.set_right(bb, bar_index)
+                label.set_x(ll, bar_index)
+                label.set_text(ll, nm + " ✗swept")
+                label.set_textcolor(ll, color.new(color.gray, 10))
+                array.push(hLbl, ll)
+                array.push(hBar, bar_index)
+                array.push(hPx, close)
+                array.push(hDir, -1)
+                array.push(hDone, false)
+                array.push(hNm, nm)
+            else
+                box.delete(bb)
+                label.delete(ll)
+            array.remove(bLvl, i)
+            array.remove(bBar, i)
+            array.remove(bTch, i)
+            array.remove(bEq, i)
+            array.remove(bBox, i)
+            array.remove(bLbl, i)
+            array.remove(bId, i)
+            array.remove(bLast, i)
+            array.remove(bStr, i)
+        else
+            if high >= lvl - zoneH * 0.5 and high <= lvl + zoneH * 0.5 and bar_index - array.get(bLast, i) > 3
+                array.set(bTch, i, array.get(bTch, i) + 1)
+                array.set(bLast, i, bar_index)
+                st = f_strength(array.get(bEq, i), array.get(bTch, i))
+                array.set(bStr, i, st)
+                if showZoneLbl
+                    label.set_text(ll, f_zoneText(nm, array.get(bTch, i), st))
+            if bar_index - array.get(bBar, i) > poolExpiry
+                box.delete(bb)
+                label.delete(ll)
+                array.remove(bLvl, i)
+                array.remove(bBar, i)
+                array.remove(bTch, i)
+                array.remove(bEq, i)
+                array.remove(bBox, i)
+                array.remove(bLbl, i)
+                array.remove(bId, i)
+                array.remove(bLast, i)
+                array.remove(bStr, i)
+
+// =====================================================================================
+//  SWEEP / TOUCH / EXPIRY — SELL-SIDE
+// =====================================================================================
+sweptSSL = false
+bool sweptSSLeq = false
+float sweptSSLlvl = na
+if showLiq and array.size(sLvl) > 0
+    for i = array.size(sLvl) - 1 to 0
+        lvl = array.get(sLvl, i)
+        bb  = array.get(sBox, i)
+        ll  = array.get(sLbl, i)
+        nm  = f_zoneName(array.get(sEq, i), false, array.get(sId, i))
+        box.set_right(bb, bar_index + lblOffset)
+        label.set_x(ll, bar_index + lblOffset)
+        if low < lvl and close > lvl
+            sweptSSL := true
+            sweptSSLlvl := lvl
+            if array.get(sEq, i)
+                sweptSSLeq := true
+            if showSwept
+                box.set_bgcolor(bb, color.new(color.gray, 90))
+                box.set_border_color(bb, color.new(color.gray, 60))
+                box.set_right(bb, bar_index)
+                label.set_x(ll, bar_index)
+                label.set_text(ll, nm + " ✗swept")
+                label.set_textcolor(ll, color.new(color.gray, 10))
+                array.push(hLbl, ll)
+                array.push(hBar, bar_index)
+                array.push(hPx, close)
+                array.push(hDir, 1)
+                array.push(hDone, false)
+                array.push(hNm, nm)
+            else
+                box.delete(bb)
+                label.delete(ll)
+            array.remove(sLvl, i)
+            array.remove(sBar, i)
+            array.remove(sTch, i)
+            array.remove(sEq, i)
+            array.remove(sBox, i)
+            array.remove(sLbl, i)
+            array.remove(sId, i)
+            array.remove(sLast, i)
+            array.remove(sStr, i)
+        else
+            if low <= lvl + zoneH * 0.5 and low >= lvl - zoneH * 0.5 and bar_index - array.get(sLast, i) > 3
+                array.set(sTch, i, array.get(sTch, i) + 1)
+                array.set(sLast, i, bar_index)
+                st = f_strength(array.get(sEq, i), array.get(sTch, i))
+                array.set(sStr, i, st)
+                if showZoneLbl
+                    label.set_text(ll, f_zoneText(nm, array.get(sTch, i), st))
+            if bar_index - array.get(sBar, i) > poolExpiry
+                box.delete(bb)
+                label.delete(ll)
+                array.remove(sLvl, i)
+                array.remove(sBar, i)
+                array.remove(sTch, i)
+                array.remove(sEq, i)
+                array.remove(sBox, i)
+                array.remove(sLbl, i)
+                array.remove(sId, i)
+                array.remove(sLast, i)
+                array.remove(sStr, i)
+
+// =====================================================================================
+//  POST-SWEEP PERFORMANCE AUDIT (in R)
+// =====================================================================================
+hiWin = ta.highest(high, auditBars)
+loWin = ta.lowest(low,  auditBars)
+if auditOn and array.size(hBar) > 0
+    for i = array.size(hBar) - 1 to 0
+        if not array.get(hDone, i) and bar_index - array.get(hBar, i) >= auditBars
+            px  = array.get(hPx, i)
+            dir = array.get(hDir, i)
+            mfe = atr > 0 ? (dir > 0 ? (hiWin - px) : (px - loWin)) / atr : 0.0
+            lb  = array.get(hLbl, i)
+            label.set_text(lb, array.get(hNm, i) + " ⇒ " + str.tostring(mfe, "#.#") + "R")
+            label.set_textcolor(lb, mfe >= 1.0 ? colBuy : mfe <= 0.3 ? colSell : color.new(color.gray, 10))
+            array.set(hDone, i, true)
+while array.size(hBar) > maxHist
+    label.delete(array.shift(hLbl))
+    array.shift(hBar)
+    array.shift(hPx)
+    array.shift(hDir)
+    array.shift(hDone)
+    array.shift(hNm)
+
+// =====================================================================================
+//  START-POINT ENTRY SIGNALS
+// =====================================================================================
+f_nearestAbove(array<float> a) =>
+    float best = na
+    if array.size(a) > 0
+        for i = 0 to array.size(a) - 1
+            v = array.get(a, i)
+            if v > close and (na(best) or v < best)
+                best := v
+    best
+f_nearestBelow(array<float> a) =>
+    float best = na
+    if array.size(a) > 0
+        for i = 0 to array.size(a) - 1
+            v = array.get(a, i)
+            if v < close and (na(best) or v > best)
+                best := v
+    best
+nextBSL = f_nearestAbove(bLvl)
+nextSSL = f_nearestBelow(sLvl)
+
+// DEFAULT = fade the fresh swing (new BSL → SELL, new SSL → BUY);
+// the magnet option trades toward the fresh pool instead.
+magnet     = sigDir == "BSL→BUY · SSL→SELL"
+buySig     = showSignals and (magnet ? bslStart : sslStart)
+sellSig    = showSignals and (magnet ? sslStart : bslStart)
+buyPoolNm  = magnet ? newBSLnm  : newSSLnm
+buyPoolLv  = magnet ? newBSLlvl : newSSLlvl
+sellPoolNm = magnet ? newSSLnm  : newBSLnm
+sellPoolLv = magnet ? newSSLlvl : newBSLlvl
+buyTgt     = magnet ? newBSLlvl : nextBSL      // level price is drawn toward
+sellTgt    = magnet ? newSSLlvl : nextSSL
+
+slLong   = close - atr * atrSL
+tpLong   = close + atr * atrSL * rrTarget
+slShort  = close + atr * atrSL
+tpShort  = close - atr * atrSL * rrTarget
+winLow   = ta.lowest(low,  pivLen + 1)          // covers the actual start bar
+winHigh  = ta.highest(high, pivLen + 1)
+
+// sweep markers (part of the pool lifecycle)
+plotshape(showLiq and sweptSSL, title="SSL Sweep", style=shape.triangleup,   location=location.belowbar, color=color.new(colBuy, 35),  size=size.tiny)
+plotshape(showLiq and sweptBSL, title="BSL Sweep", style=shape.triangledown, location=location.abovebar, color=color.new(colSell, 35), size=size.tiny)
+
+// the full entry label is anchored back at the TRUE start bar of the pool
+if showSignals and buySig
+    label.new(bar_index - pivLen, winLow - atr * 0.8,
+       "BUY · " + buyPoolNm + " start\nEntry " + str.tostring(close, format.mintick) +
+       "\nSL " + str.tostring(slLong, format.mintick) +
+       "\nTP " + str.tostring(tpLong, format.mintick) +
+       (na(buyTgt) ? "" : "\n→ pool " + str.tostring(buyTgt, format.mintick)),
+       style=label.style_label_up, color=color.new(colBuy, 12), textcolor=color.white, size=size.small)
+
+if showSignals and sellSig
+    label.new(bar_index - pivLen, winHigh + atr * 0.8,
+       "SELL · " + sellPoolNm + " start\nEntry " + str.tostring(close, format.mintick) +
+       "\nSL " + str.tostring(slShort, format.mintick) +
+       "\nTP " + str.tostring(tpShort, format.mintick) +
+       (na(sellTgt) ? "" : "\n→ pool " + str.tostring(sellTgt, format.mintick)),
+       style=label.style_label_down, color=color.new(colSell, 12), textcolor=color.white, size=size.small)
+
+// =====================================================================================
+//  ALERTS
+// =====================================================================================
+alertcondition(buySig,   "BUY — liquidity start",  "BSL/SSL: new liquidity pool started → BUY")
+alertcondition(sellSig,  "SELL — liquidity start", "BSL/SSL: new liquidity pool started → SELL")
+alertcondition(sweptSSL, "Sell-side sweep",        "BSL/SSL: sell-side liquidity swept")
+alertcondition(sweptBSL, "Buy-side sweep",         "BSL/SSL: buy-side liquidity swept")
+
+if buySig
+    alert("BUY [" + buyPoolNm + " START] pool @ " + str.tostring(buyPoolLv, format.mintick) +
+       " | Entry " + str.tostring(close, format.mintick) +
+       " SL " + str.tostring(slLong, format.mintick) +
+       " TP " + str.tostring(tpLong, format.mintick) +
+       " | swing confirmed " + str.tostring(pivLen) + " bars after the actual " + (magnet ? "high" : "low"), alert.freq_once_per_bar_close)
+if sellSig
+    alert("SELL [" + sellPoolNm + " START] pool @ " + str.tostring(sellPoolLv, format.mintick) +
+       " | Entry " + str.tostring(close, format.mintick) +
+       " SL " + str.tostring(slShort, format.mintick) +
+       " TP " + str.tostring(tpShort, format.mintick) +
+       " | swing confirmed " + str.tostring(pivLen) + " bars after the actual " + (magnet ? "low" : "high"), alert.freq_once_per_bar_close)
