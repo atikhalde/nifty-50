@@ -1,0 +1,11 @@
+# secrets — never commit
+.env
+
+# virtualenv / caches
+.venv/
+__pycache__/
+*.pyc
+
+# runtime artifacts
+logs/
+data/
