@@ -37,7 +37,8 @@ def _fmt_inr(v: float) -> str:
 
 
 class LiveScanner:
-    def __init__(self, cfg, params: BSLSSLParams | None = None, feed=None):
+    def __init__(self, cfg, params: BSLSSLParams | None = None, feed=None,
+                 lookback_minutes: int = 0, market_check: bool = True):
         self.cfg = cfg
         self.params = params or BSLSSLParams.from_env()
         self.tz = ZoneInfo(cfg.tz)
@@ -51,6 +52,13 @@ class LiveScanner:
             chat_id=cfg.chat_id, chat_id_2=cfg.chat_id_2,
             enabled=cfg.telegram_enabled,
         )
+        # Lookback mode (cloud/Actions): the engine runs on the FULL warm-up
+        # window so its pool state converges exactly like a live scanner, but
+        # alerts fire only for closed bars inside the last `lookback_minutes`.
+        # Alert dedupe comes from the cached `data/sent_alerts.json` (shared
+        # across fresh machines), NOT from last_evaluated.
+        self.lookback_minutes = int(lookback_minutes or 0)
+        self.market_check = market_check
 
     # ------------------------------------------------------------------
     # main loop
@@ -73,7 +81,11 @@ class LiveScanner:
             self.state.persist()
 
     def tick(self) -> None:
-        if self.cfg.market_hours_only and not self._market_open():
+        # In lookback mode the schedule already encodes market hours — never
+        # gate on the local clock (an Actions run is a fresh machine, and the
+        # cached window is what matters).
+        if (self.market_check and self.cfg.market_hours_only
+                and not self.lookback_minutes and not self._market_open()):
             log.debug("market closed — idle")
             return
         now = datetime.now(self.tz)
@@ -102,18 +114,28 @@ class LiveScanner:
         if len(closed) == 0:
             return
 
-        last_ev = self.state.last_evaluated.get(tf)
-        if last_ev is None:
-            # First run for this timeframe: baseline only, do NOT alert history.
-            self.state.set_last_evaluated(tf, closed[-1].isoformat())
-            self.state.persist()
-            log.info("[%s] baseline set at %s (skipping history)", tf, closed[-1])
-            return
+        if self.lookback_minutes:
+            # Cloud lookback: the engine already ran over the full warm-up
+            # window (feed returns full history), so pool state converges like
+            # a live scanner. Alert ONLY on closed bars inside the recent
+            # lookback window; every alert key still goes through the
+            # persistent dedupe, so replaying the window on every fresh run
+            # can never send a duplicate.
+            cutoff = df.index.max() - pd.Timedelta(minutes=self.lookback_minutes)
+            new_bars = closed[closed > cutoff]
+        else:
+            last_ev = self.state.last_evaluated.get(tf)
+            if last_ev is None:
+                # First run for this timeframe: baseline only, do NOT alert history.
+                self.state.set_last_evaluated(tf, closed[-1].isoformat())
+                self.state.persist()
+                log.info("[%s] baseline set at %s (skipping history)", tf, closed[-1])
+                return
 
-        threshold = pd.Timestamp(last_ev).tz_convert(self.tz)
-        new_bars = closed[closed > threshold]
-        if len(new_bars) == 0:
-            return
+            threshold = pd.Timestamp(last_ev).tz_convert(self.tz)
+            new_bars = closed[closed > threshold]
+            if len(new_bars) == 0:
+                return
 
         changed = False
         for ts in new_bars:
@@ -121,11 +143,23 @@ class LiveScanner:
             bar = df.loc[ts]
             changed |= self._emit_bar(tf, ts, row, bar)
 
-        self.state.set_last_evaluated(tf, new_bars[-1].isoformat())
-        self.state.persist()
-        if changed:
-            log.info("[%s] processed %d new closed bar(s), last=%s",
-                     tf, len(new_bars), new_bars[-1])
+        if self.lookback_minutes:
+            if changed:
+                # persist ONLY on change — a no-change run leaves the cached
+                # state file untouched (no useless cache churn every 5 min)
+                self.state.persist()
+                log.info("[%s] lookback: %d closed bar(s) in the last %dm "
+                         "window, alerts fired",
+                         tf, len(new_bars), self.lookback_minutes)
+            else:
+                log.info("[%s] lookback: %d closed bar(s) in window, nothing "
+                         "new to send", tf, len(new_bars))
+        else:
+            self.state.set_last_evaluated(tf, new_bars[-1].isoformat())
+            self.state.persist()
+            if changed:
+                log.info("[%s] processed %d new closed bar(s), last=%s",
+                         tf, len(new_bars), new_bars[-1])
 
     # ------------------------------------------------------------------
     def _emit_bar(self, tf, ts, row, bar) -> bool:
@@ -148,7 +182,14 @@ class LiveScanner:
                 continue
             result = self.notifier.send(text)
             if result is False:
-                log.warning("Alert delivery failed, will retry next cycle: %s", key)
+                if self.lookback_minutes:
+                    # one-shot run: log and move on — the same bar will be
+                    # inside the next run's window, but the key was NOT marked,
+                    # so it gets exactly one more chance next run
+                    log.warning("Alert delivery failed in lookback run, will try "
+                                "next run: %s", key)
+                else:
+                    log.warning("Alert delivery failed, will retry next cycle: %s", key)
             else:
                 # delivered (True) or dry-run/logged (None) — never send again
                 self.state.mark(key)
