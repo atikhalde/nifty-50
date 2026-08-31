@@ -6,6 +6,9 @@ Usage:
     python run_scanner.py --mock          # offline preview on synthetic data
     python run_scanner.py --once          # single scan cycle, then exit
     python run_scanner.py --mock --once   # single offline cycle (no network)
+    python run_scanner.py --lookback 20   # scan last 20m of closed bars, exit
+                                          # (GitHub Actions mode; also set via
+                                          #  LOOKBACK_MINUTES in the env)
 """
 
 from __future__ import annotations
@@ -48,6 +51,9 @@ def main() -> int:
                     help="Run on synthetic data (no yfinance/network needed)")
     ap.add_argument("--once", action="store_true",
                     help="Run one scan cycle and exit")
+    ap.add_argument("--lookback", type=int, default=None,
+                    help="Scan the last N minutes of closed bars and exit "
+                         "(defaults to LOOKBACK_MINUTES from the environment)")
     ap.add_argument("--dump-sample", action="store_true",
                     help="Print sample BUY/SELL/sweep Telegram messages (offline) and exit")
     ap.add_argument("--verbose", action="store_true", help="Debug logging")
@@ -58,13 +64,16 @@ def main() -> int:
 
     params = BSLSSLParams.from_env()
     feed = MockFeed() if args.mock else None
+    lookback = int(args.lookback if args.lookback is not None else cfg.lookback_minutes)
 
     if args.mock:
         cfg.market_hours_only = False   # synthetic data is always "open"
         if not args.once:
             cfg.scan_interval_sec = min(cfg.scan_interval_sec, 2)  # faster demo
 
-    scanner = LiveScanner(cfg, params=params, feed=feed)
+    scanner = LiveScanner(cfg, params=params, feed=feed,
+                          lookback_minutes=lookback,
+                          market_check=not lookback)
 
     if args.dump_sample:
         from scanner.data.mock import make_mock_bars
@@ -99,10 +108,11 @@ def main() -> int:
         log.warning("No Telegram credentials found — set BOT1_TOKEN/BOT2_TOKEN and CHAT_ID in .env "
                     "(see .env.example). Alerts will only be logged until then.")
 
-    if args.once:
+    if args.once or lookback:
         scanner.tick()
         scanner.state.persist()
-        logging.getLogger("scanner").info("single cycle done")
+        logging.getLogger("scanner").info(
+            "single cycle done%s", " (lookback %dm)" % lookback if lookback else "")
         return 0
 
     scanner.run_forever()
