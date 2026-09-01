@@ -38,6 +38,10 @@ class ScannerConfig:
     market_hours_only: bool = _env_bool("MARKET_HOURS_ONLY", True)
     session_start: str = os.getenv("SESSION_START", "09:15")
     session_end: str = os.getenv("SESSION_END", "15:30")
+    # extra minutes AFTER session_end during which closed bars are still
+    # processed — without it, signals on the final bar of the day (which
+    # closes exactly at 15:30) slip to the next morning's first scan cycle
+    eod_grace_min: int = int(os.getenv("EOD_GRACE_MIN", "6"))
     tz: str = os.getenv("TZ", "Asia/Kolkata")
 
     # --- telegram (both bots receive the SAME alerts) ---

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -88,12 +88,21 @@ class LiveScanner:
                 log.exception("timeframe %s failed", tf)
 
     # ------------------------------------------------------------------
-    def _market_open(self) -> bool:
-        now = datetime.now(self.tz)
+    def _market_open(self, now: datetime | None = None) -> bool:
+        """True during the NSE session, plus a short grace window after the
+        close so the final bars (which close exactly at session_end, e.g. the
+        15:25-15:30 5m bar) still get processed TODAY instead of slipping to
+        the next morning. After the session no new bars can form, so the grace
+        window can only flush late-fetched closed bars — it cannot invent
+        extra signals.
+        """
+        now = now or datetime.now(self.tz)
         if now.weekday() >= 5:          # Sat/Sun
             return False
-        t = now.time()
-        return dtime.fromisoformat(self.cfg.session_start) <= t <= dtime.fromisoformat(self.cfg.session_end)
+        start = dtime.fromisoformat(self.cfg.session_start)
+        end_dt = datetime.combine(now.date(), dtime.fromisoformat(self.cfg.session_end),
+                                  tzinfo=self.tz) + timedelta(minutes=getattr(self.cfg, "eod_grace_min", 0))
+        return start <= now.time() <= end_dt.time()
 
     # ------------------------------------------------------------------
     def _process_new_closed_bars(self, tf, df, sig, now) -> None:
@@ -141,26 +150,44 @@ class LiveScanner:
                 alerts.append(("SWEEP_BSL", self._build_sweep_msg("BSL", tf, ts, row)))
 
         changed = False
+        bots = self.notifier.bot_names
         for kind, text in alerts:
-            lvl = self._level_of(kind, row)
+            lvl = self._level_of(kind, row, self.params.magnet)
             key = f"{self.cfg.display_symbol}|{tf}|{kind}|{ts.isoformat()}|{round(lvl, 4) if lvl == lvl else 'na'}"
             if self.state.already_sent(key):
                 continue
-            result = self.notifier.send(text)
-            if result is False:
-                log.warning("Alert delivery failed, will retry next cycle: %s", key)
-            else:
-                # delivered (True) or dry-run/logged (None) — never send again
+            # per-bot delivery tracking: retry ONLY the bots that have not
+            # acknowledged yet (no duplicates on the bot that succeeded)
+            pending = [b for b in bots if not self.state.already_sent(f"{key}@{b}")]
+            if bots and not pending:
+                self.state.mark(key)     # upgraded legacy/partial state
+                continue
+            result = self.notifier.send(text, only=pending or None)
+            if result is None:
+                # dry-run / not configured: logged once, never sent again
                 self.state.mark(key)
                 changed = True
+                continue
+            for name, ok in result.items():
+                if ok:
+                    self.state.mark(f"{key}@{name}")
+            if all(self.state.already_sent(f"{key}@{b}") for b in bots) or not bots:
+                self.state.mark(key)
+                changed = True
+            else:
+                log.warning("Partial delivery (%s), will retry missing bots next cycle: %s",
+                            {k: v for k, v in result.items() if not v}, key)
         return changed
 
     @staticmethod
-    def _level_of(kind: str, row) -> float:
+    def _level_of(kind: str, row, magnet: bool = False) -> float:
+        """Pool level behind a BUY/SELL alert — direction mapping must mirror
+        the Pine script: default (fade) BUY <= new SSL pool, SELL <= new BSL
+        pool; magnet mode flips both."""
         if kind == "BUY":
-            return row["new_ssl_lvl"]
+            return row["new_bsl_lvl"] if magnet else row["new_ssl_lvl"]
         if kind == "SELL":
-            return row["new_bsl_lvl"]
+            return row["new_ssl_lvl"] if magnet else row["new_bsl_lvl"]
         if kind == "SWEEP_SSL":
             return row["swept_ssl_lvl"]
         if kind == "SWEEP_BSL":
@@ -173,17 +200,24 @@ class LiveScanner:
     def _build_signal_msg(self, side: str, tf, ts, row, bar) -> str:
         sym = self.cfg.display_symbol
         entry = float(bar["close"])
+        magnet = self.params.magnet
+        # Pine: default (fade)  BUY=SSL start / SELL=BSL start, target = nearest opposite pool
+        #       magnet          BUY=BSL start / SELL=SSL start, target = the fresh pool itself
         if side == "BUY":
-            pool_name, pool_lvl = row["new_ssl_name"], row["new_ssl_lvl"]
+            pool_name = row["new_bsl_name"] if magnet else row["new_ssl_name"]
+            pool_lvl = row["new_bsl_lvl"] if magnet else row["new_ssl_lvl"]
             sl, tp = row["sl_long"], row["tp_long"]
-            target = row["next_bsl"]
-            swing_txt = f"Swing confirmed {self.params.piv_len} bars after the actual LOW (non-repainting)"
+            target = pool_lvl if magnet else row["next_bsl"]
+            swing_kind = "HIGH" if magnet else "LOW"
+            swing_txt = f"Swing confirmed {self.params.piv_len} bars after the actual {swing_kind} (non-repainting)"
             head = f"🟢 BUY SIGNAL — {sym} ({tf})"
         else:
-            pool_name, pool_lvl = row["new_bsl_name"], row["new_bsl_lvl"]
+            pool_name = row["new_ssl_name"] if magnet else row["new_bsl_name"]
+            pool_lvl = row["new_ssl_lvl"] if magnet else row["new_bsl_lvl"]
             sl, tp = row["sl_short"], row["tp_short"]
-            target = row["next_ssl"]
-            swing_txt = f"Swing confirmed {self.params.piv_len} bars after the actual HIGH (non-repainting)"
+            target = pool_lvl if magnet else row["next_ssl"]
+            swing_kind = "LOW" if magnet else "HIGH"
+            swing_txt = f"Swing confirmed {self.params.piv_len} bars after the actual {swing_kind} (non-repainting)"
             head = f"🔴 SELL SIGNAL — {sym} ({tf})"
 
         lines = [

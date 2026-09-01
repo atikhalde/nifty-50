@@ -115,6 +115,7 @@ even across scanner restarts. Failed deliveries are retried until delivered.
 | `SCAN_INTERVAL_SEC` | `20` | scan cadence |
 | `MARKET_HOURS_ONLY` | `true` | scan only 09:15–15:30 IST Mon–Fri |
 | `SESSION_START/END` | `09:15` / `15:30` | NSE session |
+| `EOD_GRACE_MIN` | `6` | keep flushing closed bars this many minutes after the close (so the final 1m/5m bar's signal arrives today, not next morning) |
 | `SWEEP_ALERTS` | `true` | send separate 🧹 sweep alerts |
 | `PIV_LEN` | `8` | swing pivot strength (bars each side) |
 | `ATR_LEN` | `14` | ATR period |
@@ -128,6 +129,11 @@ even across scanner restarts. Failed deliveries are retried until delivered.
 > ⚠️ **Settings must match your TradingView chart.** If you changed any input
 > in the indicator's settings panel, set the same value in `.env` — otherwise
 > signals will differ.
+>
+> 📊 **Chart vs alerts not matching exactly?** See [ANALYSIS.md](ANALYSIS.md) —
+> a deep root-cause write-up (pivot tie rules, magnet mode, delivery retries,
+> Yahoo-vs-TradingView data, warm-up convergence, pool numbering) and what can
+> legitimately still differ by paise/pool-number.
 
 ---
 

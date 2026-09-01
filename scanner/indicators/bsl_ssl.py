@@ -118,8 +118,17 @@ def _atr(high, low, close, length: int) -> np.ndarray:
 def _pivots(high: np.ndarray, low: np.ndarray, piv_len: int):
     """Return (ph, pl) arrays where a confirmed pivot value appears on the
     CONFIRMATION bar (bar i+piv_len), like Pine's ta.pivothigh/pivotlow.
-    Ties are strict (a pivot must be strictly higher/lower than piv_len bars
-    on each side) - matching TradingView behaviour.
+
+    TradingView tie semantics (verified against the platform; equivalent to
+    the canonical replication `window.size - array.lastindexof(window.max) - 1 == rightbars`):
+      * the candidate must be STRICTLY greater than all NEWER bars
+        (the `piv_len` bars to its right);
+      * it TIES with / exceeds OLDER bars (the `piv_len` bars to its left),
+        i.e. older bars may be equal but not greater.
+    Consequence: with twin equal swing highs inside the pivot window, the
+    NEWER twin is the pivot (the older one is shadowed). A "strict both
+    sides" python port would mark NEITHER twin — silently dropping every
+    signal built on flat double tops/bottoms (very common on 1m, tick 0.05).
     """
     n = len(high)
     ph = np.full(n, np.nan)
@@ -127,9 +136,11 @@ def _pivots(high: np.ndarray, low: np.ndarray, piv_len: int):
     if piv_len <= 0 or n < 2 * piv_len + 1:
         return ph, pl
     for i in range(piv_len, n - piv_len):
-        if high[i] > high[i - piv_len:i].max() and high[i] > high[i + 1:i + piv_len + 1].max():
+        # older side: strictly-greater invalidates (ties allowed)
+        # newer side: greater-or-equal invalidates (ties forbidden)
+        if high[i] >= high[i - piv_len:i].max() and high[i] > high[i + 1:i + piv_len + 1].max():
             ph[i + piv_len] = high[i]
-        if low[i] < low[i - piv_len:i].min() and low[i] < low[i + 1:i + piv_len + 1].min():
+        if low[i] <= low[i - piv_len:i].min() and low[i] < low[i + 1:i + piv_len + 1].min():
             pl[i + piv_len] = low[i]
     return ph, pl
 

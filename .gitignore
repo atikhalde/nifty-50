@@ -6,6 +6,6 @@
 __pycache__/
 *.pyc
 
-# runtime artifacts
-logs/
-data/
+# runtime artifacts (root-level only — scanner/data/ IS source code and must be committed)
+/logs/
+/data/
