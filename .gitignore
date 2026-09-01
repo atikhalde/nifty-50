@@ -6,6 +6,6 @@
 __pycache__/
 *.pyc
 
-# runtime artifacts
-logs/
-data/
+# runtime artifacts (root only)
+/logs/
+/data/

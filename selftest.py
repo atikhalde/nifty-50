@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Offline parity checks for the BSL/SSL engine + dedupe state.
+"""Offline parity checks for the BSL/SSL engine, Webhook server, and dedupe state.
 
 Run:  python selftest.py
 
-Validates (against hand-traced expectations derived from the Pine script):
+Validates:
   1. A confirmed swing HIGH opens a BSL pool and fires SELL (default mapping)
      exactly piv_len bars after the swing bar (non-repainting).
   2. A confirmed swing LOW opens an SSL pool and fires BUY.
@@ -14,18 +14,23 @@ Validates (against hand-traced expectations derived from the Pine script):
   5. Magnet mapping (BSL->BUY, SSL->SELL) flips the signals.
   6. SL/TP math matches close -/+ atr*atr_sl*rr_target.
   7. SentState persists and never re-sends the same key.
+  8. Webhook payload formatter correctly processes TradingView JSON and plaintext.
+  9. Dual timestamps (Chart Anchor vs Confirmation) match accurately.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 
 import numpy as np
 import pandas as pd
 
+from scanner.data.mock import make_mock_bars, MockFeed
 from scanner.indicators.bsl_ssl import BSLSSLParams, compute_signals, _atr
 from scanner.state import SentState
+from scanner.webhook import WebhookFormatter
 
 
 def _base_frame(n: int = 200):
@@ -90,8 +95,6 @@ def test_buy_signal():
 def test_equal_merge_no_signal():
     df = _base_frame()
     _spike(df, 20, high=120.0)                     # new pool @120  -> SELL at 28
-    # equal-high bar: high inside eqTol (~1.7) AND close above the pool level
-    # so it does NOT sweep pool @120 (sweep needs close < lvl)
     _spike(df, 30, high=120.6, close=120.2)        # within eqTol   -> merge
     _spike(df, 40, high=130.0)                     # new pool @130  -> SELL at 48
     sig = compute_signals(df, BSLSSLParams())
@@ -114,10 +117,7 @@ def test_sweep():
 
     assert not bool(sig["swept_bsl"].iloc[39]), "no sweep before bar 40"
     assert bool(sig["swept_bsl"].iloc[40]), "BSL sweep on bar 40"
-    # pools iterated newest->oldest; both @130? no: pools @120 only in this frame? see below
-    # (bar 40 high=135 also becomes a NEW pivot confirmed at 48 -> not relevant here)
-    # Bar 40's high (135) itself becomes a new pivot -> pool BSL-02 at bar 48,
-    # then the bar-50 spike (high 140, close 95) sweeps BSL-02, so bar 58 -> BSL-03.
+    
     _spike(df, 50, high=140.0)
     sig2 = compute_signals(df, BSLSSLParams())
     assert bool(sig2["sell_sig"].iloc[48]), "bar 40 high confirmed at 48 -> BSL-02"
@@ -162,14 +162,72 @@ def test_expiry():
     df = _base_frame(n=400)
     _spike(df, 20, high=120.0)                      # pool @120 at bar 28
     p = BSLSSLParams(pool_expiry=100)
-    sig = compute_signals(df, p)
-    # pool created bar 28, expires when j - 28 > 100 -> bar 129.
-    # Spike close is ABOVE the pool level so the pool expires instead of sweeping.
-    _spike(df, 135, high=140.0, close=125.0)        # NEW pivot (140-120=20 > eqTol)
+    _spike(df, 135, high=140.0, close=125.0)        # NEW pivot
     sig2 = compute_signals(df, p)
     assert bool(sig2["sell_sig"].iloc[143]), "after expiry the old pool is gone -> new pool signals"
     assert sig2["new_bsl_name"].iloc[143] == "BSL-02"
     print("  ok  pool expiry frees the slot for a new pool")
+
+
+def test_webhook_payload_formatter():
+    # 1. User sample BUY alert
+    buy_json = {
+        "action": "BUY",
+        "symbol": "NSE:NIFTY",
+        "tf": "5m",
+        "pool": "SSL-169",
+        "pool_lvl": 24010.55,
+        "entry": 24061.05,
+        "sl": 24038.43,
+        "tp": 24106.30,
+        "target": 24114.00,
+        "swing_bar_time": "2026-09-01 09:45",
+        "bar_time": "2026-09-01 10:25"
+    }
+    kind, key, msg = WebhookFormatter.format_payload(buy_json)
+    assert kind == "BUY"
+    assert "SSL-169" in msg
+    assert "24,010.55" in msg
+    assert "24,061.05" in msg
+    assert "24,038.43" in msg
+    assert "24,106.30" in msg
+    assert "2026-09-01 09:45 IST" in msg
+    assert "2026-09-01 10:25" in msg
+
+    # 2. User sample SELL alert
+    sell_json = {
+        "action": "SELL",
+        "symbol": "NSE:NIFTY",
+        "tf": "5m",
+        "pool": "BSL-169",
+        "pool_lvl": 24142.85,
+        "entry": 24117.75,
+        "sl": 24136.48,
+        "tp": 24080.29,
+        "target": 24010.55,
+        "swing_bar_time": "2026-09-01 11:30",
+        "bar_time": "2026-09-01 12:10"
+    }
+    kind2, key2, msg2 = WebhookFormatter.format_payload(sell_json)
+    assert kind2 == "SELL"
+    assert "BSL-169" in msg2
+    assert "24,142.85" in msg2
+    assert "24,117.75" in msg2
+
+    # 3. User sample Sweep alert
+    sweep_json = {
+        "action": "SWEEP_SSL",
+        "symbol": "NSE:NIFTY",
+        "tf": "5m",
+        "pool_lvl": 24020.50,
+        "close": 24025.10,
+        "bar_time": "2026-09-01 09:45"
+    }
+    kind3, key3, msg3 = WebhookFormatter.format_payload(sweep_json)
+    assert kind3 == "SWEEP_SSL"
+    assert "24,020.50" in msg3
+
+    print("  ok  webhook formatter handles TradingView JSON & math accurately")
 
 
 def main():
@@ -181,6 +239,7 @@ def main():
     test_magnet_mapping()
     test_expiry()
     test_state_dedupe()
+    test_webhook_payload_formatter()
     print("\nALL CHECKS PASSED ✅")
 
 

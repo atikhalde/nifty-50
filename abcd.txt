@@ -1,5 +1,5 @@
 // =====================================================================================
-//  BSL / SSL LIQUIDITY START SIGNALS — v5 LITE
+//  BSL / SSL LIQUIDITY START SIGNALS — v5 LITE (Webhook & Zero-Delay Parity Edition)
 //  ---------------------------------------------------------------------------------
 //  Stripped-down build of the NIFTY Liquidity & Bias Engine. EVERYTHING except the
 //  buy-side / sell-side liquidity pools was removed: no pivots, no CPR, no S/R zones,
@@ -18,10 +18,10 @@
 //     DEFAULT mapping (fade the fresh swing):  new BSL → SELL  ·  new SSL → BUY
 //     Alternative "magnet" mapping (via input): new BSL → BUY (drawn up to the pool)
 //                                               new SSL → SELL (drawn down to it)
-//     NOTE on timing: a swing can only be confirmed `pivLen` bars after the actual
-//     high/low, so the signal FIRES on the confirmation bar (non-repainting) while
-//     the label is drawn back at the true start bar. Equal-high/low merges count as
-//     a touch of an EXISTING pool, not a new start, so they do not fire signals.
+//     TIMING & NON-REPAINTING:
+//     A swing can only be mathematically confirmed `pivLen` bars after the actual
+//     high/low, so the signal FIRES on the confirmation bar close (non-repainting) while
+//     the label is drawn back at the true swing start bar for visual chart clarity.
 // =====================================================================================
 
 //@version=5
@@ -56,7 +56,10 @@ sigDir        = input.string("BSL→SELL · SSL→BUY", "Signal direction", opti
 atrSL         = input.float(1.2,  "Stop loss (× ATR)",         minval=0.2, step=0.1, group=grpS)
 rrTarget      = input.float(2.0,  "Reward:Risk target",        minval=0.5, step=0.5, group=grpS)
 
-grpU = "⑤ Colours"
+grpW = "⑤ Webhook & Alert Format"
+alertFmt      = input.string("JSON (Webhook)", "Alert Message Format", options=["JSON (Webhook)","Human-Readable"], group=grpW, tooltip="JSON format delivers instant, structured alerts to the Webhook receiver. Human-Readable is for popups and standard forwards.")
+
+grpU = "⑥ Colours"
 colBuy        = input.color(color.new(#089981, 0),  "Bullish",       inline="c1", group=grpU)
 colSell       = input.color(color.new(#f23645, 0),  "Bearish",       inline="c1", group=grpU)
 colBSL        = input.color(color.new(#f23645, 80), "Buy-side liq",  inline="c2", group=grpU)
@@ -442,22 +445,36 @@ if showSignals and sellSig
        style=label.style_label_down, color=color.new(colSell, 12), textcolor=color.white, size=size.small)
 
 // =====================================================================================
-//  ALERTS
+//  ALERTS (Webhook & Multi-Channel Telegram Parity)
 // =====================================================================================
 alertcondition(buySig,   "BUY — liquidity start",  "BSL/SSL: new liquidity pool started → BUY")
 alertcondition(sellSig,  "SELL — liquidity start", "BSL/SSL: new liquidity pool started → SELL")
 alertcondition(sweptSSL, "Sell-side sweep",        "BSL/SSL: sell-side liquidity swept")
 alertcondition(sweptBSL, "Buy-side sweep",         "BSL/SSL: buy-side liquidity swept")
 
+f_timeStr(int t) =>
+    str.format_time(t, "yyyy-MM-dd HH:mm", "Asia/Kolkata")
+
 if buySig
-    alert("BUY [" + buyPoolNm + " START] pool @ " + str.tostring(buyPoolLv, format.mintick) +
-       " | Entry " + str.tostring(close, format.mintick) +
-       " SL " + str.tostring(slLong, format.mintick) +
-       " TP " + str.tostring(tpLong, format.mintick) +
-       " | swing confirmed " + str.tostring(pivLen) + " bars after the actual " + (magnet ? "high" : "low"), alert.freq_once_per_bar_close)
+    msg = alertFmt == "JSON (Webhook)" ? 
+       ('{"action":"BUY","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","pool":"' + buyPoolNm + '","pool_lvl":' + str.tostring(buyPoolLv) + ',"entry":' + str.tostring(close) + ',"sl":' + str.tostring(slLong) + ',"tp":' + str.tostring(tpLong) + ',"target":' + (na(buyTgt) ? 'null' : str.tostring(buyTgt)) + ',"swing_bar_time":"' + f_timeStr(time[pivLen]) + '","bar_time":"' + f_timeStr(time) + '"}') :
+       ("🟢 BUY SIGNAL — " + syminfo.ticker + " (" + timeframe.period + ")\n📌 Fresh " + buyPoolNm + " pool start @ " + str.tostring(buyPoolLv, format.mintick) + "\n💵 Entry: " + str.tostring(close, format.mintick) + "\n🛑 SL: " + str.tostring(slLong, format.mintick) + " · 🎯 TP: " + str.tostring(tpLong, format.mintick) + (na(buyTgt) ? "" : "\n🎯 Nearest pool: " + str.tostring(buyTgt, format.mintick)) + "\n📍 Chart Anchor (Swing Low): " + f_timeStr(time[pivLen]) + " IST\n⚡ Swing confirmed " + str.tostring(pivLen) + " bars after actual LOW (non-repainting)\nBar: " + f_timeStr(time) + " IST")
+    alert(msg, alert.freq_once_per_bar_close)
+
 if sellSig
-    alert("SELL [" + sellPoolNm + " START] pool @ " + str.tostring(sellPoolLv, format.mintick) +
-       " | Entry " + str.tostring(close, format.mintick) +
-       " SL " + str.tostring(slShort, format.mintick) +
-       " TP " + str.tostring(tpShort, format.mintick) +
-       " | swing confirmed " + str.tostring(pivLen) + " bars after the actual " + (magnet ? "low" : "high"), alert.freq_once_per_bar_close)
+    msg = alertFmt == "JSON (Webhook)" ? 
+       ('{"action":"SELL","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","pool":"' + sellPoolNm + '","pool_lvl":' + str.tostring(sellPoolLv) + ',"entry":' + str.tostring(close) + ',"sl":' + str.tostring(slShort) + ',"tp":' + str.tostring(tpShort) + ',"target":' + (na(sellTgt) ? 'null' : str.tostring(sellTgt)) + ',"swing_bar_time":"' + f_timeStr(time[pivLen]) + '","bar_time":"' + f_timeStr(time) + '"}') :
+       ("🔴 SELL SIGNAL — " + syminfo.ticker + " (" + timeframe.period + ")\n📌 Fresh " + sellPoolNm + " pool start @ " + str.tostring(sellPoolLv, format.mintick) + "\n💵 Entry: " + str.tostring(close, format.mintick) + "\n🛑 SL: " + str.tostring(slShort, format.mintick) + " · 🎯 TP: " + str.tostring(tpShort, format.mintick) + (na(sellTgt) ? "" : "\n🎯 Nearest pool: " + str.tostring(sellTgt, format.mintick)) + "\n📍 Chart Anchor (Swing High): " + f_timeStr(time[pivLen]) + " IST\n⚡ Swing confirmed " + str.tostring(pivLen) + " bars after actual HIGH (non-repainting)\nBar: " + f_timeStr(time) + " IST")
+    alert(msg, alert.freq_once_per_bar_close)
+
+if sweptSSL
+    msg = alertFmt == "JSON (Webhook)" ?
+       ('{"action":"SWEEP_SSL","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","pool_lvl":' + str.tostring(sweptSSLlvl) + ',"close":' + str.tostring(close) + ',"bar_time":"' + f_timeStr(time) + '"}') :
+       ("🧹 SSL SWEPT (Bullish Reclaim) — " + syminfo.ticker + " (" + timeframe.period + ")\n📈 Sell-side liquidity pool @ " + str.tostring(sweptSSLlvl, format.mintick) + " was swept — bullish (price reclaimed)\nClose " + str.tostring(close, format.mintick) + " > level " + str.tostring(sweptSSLlvl, format.mintick) + "\n📍 Chart Marker: ▲ Green Triangle below bar\nBar: " + f_timeStr(time) + " IST")
+    alert(msg, alert.freq_once_per_bar_close)
+
+if sweptBSL
+    msg = alertFmt == "JSON (Webhook)" ?
+       ('{"action":"SWEEP_BSL","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","pool_lvl":' + str.tostring(sweptBSLlvl) + ',"close":' + str.tostring(close) + ',"bar_time":"' + f_timeStr(time) + '"}') :
+       ("🧹 BSL SWEPT (Bearish Rejection) — " + syminfo.ticker + " (" + timeframe.period + ")\n📉 Buy-side liquidity pool @ " + str.tostring(sweptBSLlvl, format.mintick) + " was swept — bearish (price failed above)\nClose " + str.tostring(close, format.mintick) + " < level " + str.tostring(sweptBSLlvl, format.mintick) + "\n📍 Chart Marker: ▼ Red Triangle above bar\nBar: " + f_timeStr(time) + " IST")
+    alert(msg, alert.freq_once_per_bar_close)

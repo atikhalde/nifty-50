@@ -3,6 +3,7 @@
 
 Usage:
     python run_scanner.py                 # live scan (yfinance + Telegram)
+    python run_scanner.py --webhook       # zero-delay TradingView Webhook listener
     python run_scanner.py --mock          # offline preview on synthetic data
     python run_scanner.py --once          # single scan cycle, then exit
     python run_scanner.py --mock --once   # single offline cycle (no network)
@@ -20,6 +21,7 @@ from scanner.alerts.telegram import TelegramNotifier
 from scanner.data.mock import MockFeed
 from scanner.indicators.bsl_ssl import BSLSSLParams
 from scanner.live import LiveScanner
+from scanner.webhook import WebhookServer
 
 
 def _setup_logging(cfg: ScannerConfig, verbose: bool) -> None:
@@ -44,6 +46,8 @@ def _setup_logging(cfg: ScannerConfig, verbose: bool) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="BSL/SSL liquidity scanner for NSE:NIFTY")
+    ap.add_argument("--webhook", action="store_true",
+                    help="Run TradingView zero-delay Webhook receiver server")
     ap.add_argument("--mock", action="store_true",
                     help="Run on synthetic data (no yfinance/network needed)")
     ap.add_argument("--once", action="store_true",
@@ -55,6 +59,11 @@ def main() -> int:
 
     cfg = ScannerConfig()
     _setup_logging(cfg, args.verbose)
+
+    if args.webhook:
+        server = WebhookServer(cfg)
+        server.run_forever()
+        return 0
 
     params = BSLSSLParams.from_env()
     feed = MockFeed() if args.mock else None
@@ -82,13 +91,13 @@ def main() -> int:
             bar = df.loc[ts]
             msgs = []
             if bool(row["buy_sig"]):
-                msgs.append(scanner._build_signal_msg("BUY", "5m", ts, row, bar))
+                msgs.append(scanner._build_signal_msg("BUY", "5m", ts, row, bar, df))
             if bool(row["sell_sig"]):
-                msgs.append(scanner._build_signal_msg("SELL", "5m", ts, row, bar))
+                msgs.append(scanner._build_signal_msg("SELL", "5m", ts, row, bar, df))
             if bool(row["swept_ssl"]):
-                msgs.append(scanner._build_sweep_msg("SSL", "5m", ts, row))
+                msgs.append(scanner._build_sweep_msg("SSL", "5m", ts, row, bar))
             if bool(row["swept_bsl"]):
-                msgs.append(scanner._build_sweep_msg("BSL", "5m", ts, row))
+                msgs.append(scanner._build_sweep_msg("BSL", "5m", ts, row, bar))
             print("\n" + "-" * 60)
             for m in msgs:
                 print(m)

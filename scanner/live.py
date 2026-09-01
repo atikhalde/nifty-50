@@ -1,4 +1,4 @@
-"""Live scanner: yfinance feed -> BSL/SSL engine -> strict-dedupe -> dual Telegram."""
+"""Live scanner: data feed -> BSL/SSL engine -> strict-dedupe -> dual Telegram."""
 
 from __future__ import annotations
 
@@ -18,12 +18,16 @@ from scanner.state import SentState
 log = logging.getLogger("scanner")
 
 
-def _fmt_inr(v: float) -> str:
+def _fmt_inr(v: float | None) -> str:
     """Indian-style thousands grouping, e.g. 24,31,050.25"""
     if v is None or (isinstance(v, float) and (math.isnan(v))):
         return "—"
-    neg = v < 0
-    whole, _, dec = f"{abs(v):.2f}".partition(".")
+    try:
+        val = float(v)
+    except (ValueError, TypeError):
+        return str(v)
+    neg = val < 0
+    whole, _, dec = f"{abs(val):.2f}".partition(".")
     if len(whole) > 3:
         head, tail = whole[:-3], whole[-3:]
         groups = []
@@ -119,7 +123,7 @@ class LiveScanner:
         for ts in new_bars:
             row = sig.loc[ts]
             bar = df.loc[ts]
-            changed |= self._emit_bar(tf, ts, row, bar)
+            changed |= self._emit_bar(tf, ts, row, bar, df)
 
         self.state.set_last_evaluated(tf, new_bars[-1].isoformat())
         self.state.persist()
@@ -128,17 +132,17 @@ class LiveScanner:
                      tf, len(new_bars), new_bars[-1])
 
     # ------------------------------------------------------------------
-    def _emit_bar(self, tf, ts, row, bar) -> bool:
+    def _emit_bar(self, tf, ts, row, bar, df: pd.DataFrame | None = None) -> bool:
         alerts = []
         if self.params.show_signals and bool(row["buy_sig"]):
-            alerts.append(("BUY", self._build_signal_msg("BUY", tf, ts, row, bar)))
+            alerts.append(("BUY", self._build_signal_msg("BUY", tf, ts, row, bar, df)))
         if self.params.show_signals and bool(row["sell_sig"]):
-            alerts.append(("SELL", self._build_signal_msg("SELL", tf, ts, row, bar)))
+            alerts.append(("SELL", self._build_signal_msg("SELL", tf, ts, row, bar, df)))
         if self.cfg.sweep_alerts:
             if bool(row["swept_ssl"]):
-                alerts.append(("SWEEP_SSL", self._build_sweep_msg("SSL", tf, ts, row)))
+                alerts.append(("SWEEP_SSL", self._build_sweep_msg("SSL", tf, ts, row, bar)))
             if bool(row["swept_bsl"]):
-                alerts.append(("SWEEP_BSL", self._build_sweep_msg("BSL", tf, ts, row)))
+                alerts.append(("SWEEP_BSL", self._build_sweep_msg("BSL", tf, ts, row, bar)))
 
         changed = False
         for kind, text in alerts:
@@ -170,51 +174,79 @@ class LiveScanner:
     # ------------------------------------------------------------------
     # message builders
     # ------------------------------------------------------------------
-    def _build_signal_msg(self, side: str, tf, ts, row, bar) -> str:
+    def _build_signal_msg(self, side: str, tf, ts, row, bar, df: pd.DataFrame | None = None) -> str:
         sym = self.cfg.display_symbol
         entry = float(bar["close"])
+
+        # Determine swing anchor bar timestamp
+        piv_len = self.params.piv_len
+        swing_ts_str = ""
+        if df is not None and ts in df.index:
+            loc = df.index.get_loc(ts)
+            if isinstance(loc, int) and loc >= piv_len:
+                swing_ts = df.index[loc - piv_len]
+                swing_ts_str = swing_ts.strftime("%Y-%m-%d %H:%M")
+        if not swing_ts_str:
+            delta = INTERVAL_DELTA.get(tf, pd.Timedelta(minutes=5))
+            swing_ts = ts - (piv_len * delta)
+            swing_ts_str = swing_ts.strftime("%Y-%m-%d %H:%M")
+
         if side == "BUY":
-            pool_name, pool_lvl = row["new_ssl_name"], row["new_ssl_lvl"]
+            pool_name = row["new_ssl_name"] if not self.params.magnet else row["new_bsl_name"]
+            pool_lvl = row["new_ssl_lvl"] if not self.params.magnet else row["new_bsl_lvl"]
             sl, tp = row["sl_long"], row["tp_long"]
             target = row["next_bsl"]
-            swing_txt = f"Swing confirmed {self.params.piv_len} bars after the actual LOW (non-repainting)"
             head = f"🟢 BUY SIGNAL — {sym} ({tf})"
+            anchor_txt = f"📍 Chart Anchor (Swing LOW): {swing_ts_str} IST"
+            swing_txt = f"⚡ Swing confirmed {piv_len} bars after actual LOW (non-repainting)"
         else:
-            pool_name, pool_lvl = row["new_bsl_name"], row["new_bsl_lvl"]
+            pool_name = row["new_bsl_name"] if not self.params.magnet else row["new_ssl_name"]
+            pool_lvl = row["new_bsl_lvl"] if not self.params.magnet else row["new_ssl_lvl"]
             sl, tp = row["sl_short"], row["tp_short"]
             target = row["next_ssl"]
-            swing_txt = f"Swing confirmed {self.params.piv_len} bars after the actual HIGH (non-repainting)"
             head = f"🔴 SELL SIGNAL — {sym} ({tf})"
+            anchor_txt = f"📍 Chart Anchor (Swing HIGH): {swing_ts_str} IST"
+            swing_txt = f"⚡ Swing confirmed {piv_len} bars after actual HIGH (non-repainting)"
 
         lines = [
             head,
             f"📌 Fresh {pool_name} pool start @ {_fmt_inr(pool_lvl)}",
-            f"Entry: {_fmt_inr(entry)}",
-            f"SL: {_fmt_inr(sl)}  ·  TP: {_fmt_inr(tp)}",
+            f"💵 Entry: {_fmt_inr(entry)} (Closed Confirmation Bar)",
+            f"🛑 SL: {_fmt_inr(sl)}  ·  🎯 TP: {_fmt_inr(tp)} (1:2 R:R)",
         ]
-        if target == target and not math.isnan(target):   # NaN-safe check
-            lines.append(f"🎯 Nearest pool: {_fmt_inr(target)}")
+        if target == target and not math.isnan(target):
+            lines.append(f"🎯 Nearest Target Pool: {_fmt_inr(target)}")
         lines += [
+            anchor_txt,
             swing_txt,
             f"Bar: {ts.strftime('%Y-%m-%d %H:%M')} IST",
         ]
         return "\n".join(lines)
 
-    def _build_sweep_msg(self, side: str, tf, ts, row) -> str:
+    def _build_sweep_msg(self, side: str, tf, ts, row, bar) -> str:
         sym = self.cfg.display_symbol
+        close_px = float(bar["close"])
         if side == "SSL":
             lvl = row["swept_ssl_lvl"]
-            tone = "bullish (price reclaimed the level)"
-            head = f"🧹 SSL SWEPT — {sym} ({tf})"
+            head = f"🧹 SSL SWEPT (Bullish Reclaim) — {sym} ({tf})"
             arrow = "📈"
+            kind_txt = "Sell-side liquidity pool"
+            action = "bullish (price reclaimed the level)"
+            marker_txt = "📍 Chart Marker: ▲ Green Triangle below bar"
+            detail_txt = f"Close {_fmt_inr(close_px)} > level {_fmt_inr(lvl)}"
         else:
             lvl = row["swept_bsl_lvl"]
-            tone = "bearish (price failed above the level)"
-            head = f"🧹 BSL SWEPT — {sym} ({tf})"
+            head = f"🧹 BSL SWEPT (Bearish Rejection) — {sym} ({tf})"
             arrow = "📉"
-        kind_txt = "Sell-side liquidity pool" if side == "SSL" else "Buy-side liquidity pool"
+            kind_txt = "Buy-side liquidity pool"
+            action = "bearish (price failed above the level)"
+            marker_txt = "📍 Chart Marker: ▼ Red Triangle above bar"
+            detail_txt = f"Close {_fmt_inr(close_px)} < level {_fmt_inr(lvl)}"
+
         return "\n".join([
             head,
-            f"{arrow} {kind_txt} @ {_fmt_inr(lvl)} was swept — {tone}",
+            f"{arrow} {kind_txt} @ {_fmt_inr(lvl)} was swept — {action}",
+            detail_txt,
+            marker_txt,
             f"Bar: {ts.strftime('%Y-%m-%d %H:%M')} IST",
         ])
