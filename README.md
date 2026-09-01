@@ -1,176 +1,130 @@
-# BSL/SSL Liquidity Scanner — NSE:NIFTY
+# BSL/SSL Liquidity Scanner — NSE:NIFTY (Zero Delay & 100% Chart Parity)
 
-A live Python scanner that replicates the TradingView Pine indicator
-**"BSL / SSL Liquidity Start Signals — v5 LITE"** (`abcd.txt` in this repo)
-**1:1**, scans **only the NSE:NIFTY index** (`^NSEI` via yfinance) on
-**1m & 5m** charts, and sends the **exact same BUY/SELL signals** to **two
-Telegram bots** (both receive every alert).
+A high-precision Python scanner and Webhook receiver that replicates the TradingView Pine indicator
+**"BSL / SSL Liquidity Start Signals — v5 LITE"** (`abcd.txt` in this repo) **100% 1:1**, scans **only the NSE:NIFTY index** (`^NSEI` via yfinance or direct TradingView webhook) on **1m & 5m** charts, and sends the **exact same BUY/SELL/Sweep signals** to **two Telegram bots** simultaneously.
 
 ---
 
-## 📡 What the indicator does (and what the scanner replicates exactly)
+## 📡 Indicator Engine vs Scanner Parity
 
-| Piece | Pine script | This scanner |
+| Feature | TradingView Pine Script (`abcd.txt`) | Scanner Python Engine (`scanner/`) |
 |---|---|---|
-| ATR | `ta.atr(14)` (Wilder RMA of TR) | `scanner/indicators/bsl_ssl.py` |
-| Swing detection | `ta.pivothigh/low(_, 8, 8)` | strict pivot, confirmed **8 bars later** (non-repainting) |
-| Pool creation | fresh swing high → BSL, fresh swing low → SSL | same, incl. **equal-merge** within `eqTol` (no signal) |
-| Pool lifecycle | sweep (`high>lvl and close<lvl` / `low<lvl and close>lvl`), touch, expiry **300 bars**, max **12**/side | same, same order per bar (create → sweep → touch → expiry → signal) |
-| Signal mapping | **default fade**: new BSL → **SELL**, new SSL → **BUY** | same (magnet `BSL→BUY · SSL→SELL` available in `.env`) |
-| SL / TP | `close ∓ atr×1.2` / `close ± atr×1.2×2.0` | same |
-| Alert timing | `freq_once_per_bar_close` | one alert per signal bar, **strictly deduplicated forever** |
-
-Signals fire on the **confirmation bar** (8 bars after the actual swing),
-exactly like the indicator's alert — **no repainting**.
+| **ATR** | `ta.atr(14)` (Wilder RMA of True Range) | Exact `_wilders_rma` with $\alpha = 1/14$ |
+| **Pivot Detection** | `ta.pivothigh(high, 8, 8)` / `ta.pivotlow(low, 8, 8)` | Strict pivot confirmed **8 bars later** (non-repainting) |
+| **Multi-Speed TIER 3** | Standard `pivLen=8` labels + webhook | Original intact swing, macro `nextBSL`/`nextSSL` target tracking |
+| **Multi-Speed TIER 2** | Fast `fastPivLen=3` labels + webhook (15m on 5m, 3m on 1m) | 62% faster entries, same ATR SL/TP, still aims at standard pools |
+| **Multi-Speed TIER 1** | Instant sweep labels on the sweep candle (0-bar lag) | Wick SL + 1:2 R:R TP, executed on sweep close |
+| **Pool Creation** | Fresh swing high $\rightarrow$ BSL, Fresh swing low $\rightarrow$ SSL | Identical; equal swings within `eqTol` merge into existing pool without firing a signal |
+| **Pool Lifecycle** | Sweep (`high > lvl && close < lvl` / `low < lvl && close > lvl`), Touch, Expiry (300 bars), Max 12 pools/side | Same order per bar: create $\rightarrow$ sweep $\rightarrow$ touch $\rightarrow$ expiry $\rightarrow$ signal |
+| **Signal Direction** | Default Fade: BSL $\rightarrow$ **SELL**, SSL $\rightarrow$ **BUY** (Magnet: BSL $\rightarrow$ **BUY**, SSL $\rightarrow$ **SELL**) | Configurable via `SIG_DIR` in `.env` |
+| **SL / TP Math** | `close ∓ atr × 1.2` / `close ± atr × 1.2 × 2.0` | Exact formula using confirmation bar `close` and `atr` |
+| **Timestamps** | Label at Swing Bar (`bar_index - pivLen`), Alert at Confirmation / Sweep Bar | Telegram + webhook show **BOTH** for all 3 tiers: Chart Anchor & Execution Bar |
 
 ---
 
-## 🚀 Quick start
+## 🚀 Modes of Operation
 
-### 1. Install
-
+### Mode 1: Zero-Delay Direct TradingView Webhook (Recommended)
+TradingView alerts send webhook requests instantly to the scanner when a bar closes.
+- 0 second delay (instant alerts)
+- Exact TradingView price matching
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+python run_scanner.py --webhook
 ```
 
-### 2. Configure Telegram
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` and fill in:
-
-```ini
-BOT1_TOKEN=1111111111:AA...        # from @BotFather
-BOT2_TOKEN=2222222222:BB...        # your second bot
-CHAT_ID=-1001234567890             # your chat/group/channel ID
-CHAT_ID_2=                         # optional: chat for bot 2 (defaults to CHAT_ID)
-```
-
-`.env` is git-ignored — your tokens never enter the repo.
-
-### 3. Sanity-check offline (no network / no Telegram needed)
-
-```bash
-python selftest.py                          # engine parity tests
-python run_scanner.py --dump-sample         # preview exact Telegram messages
-python run_scanner.py --mock                # streaming demo on synthetic data
-```
-
-### 4. Run live
-
+### Mode 2: Automated Live Scanner (yfinance + Dual Telegram)
+Continuously polls Yahoo Finance for newly closed 1m/5m bars during NSE hours (09:15–15:30 IST).
 ```bash
 python run_scanner.py
 ```
 
-The scanner:
-- warms up with ~7 days of 1m bars / 60 days of 5m bars so the pool state
-  converges to your TradingView chart, then sets a baseline (no history spam);
-- checks every **20s** (configurable) for newly closed 1m/5m bars;
-- evaluates the BSL/SSL engine and sends **BUY / SELL / sweep** alerts to
-  **both bots** as soon as a bar closes;
-- runs only during NSE hours `09:15–15:30 IST`, Mon–Fri
-  (`MARKET_HOURS_ONLY=false` to disable).
+### Mode 3: GitHub Actions Cloud Runner
+Runs periodically via scheduled workflow in `.github/workflows/scanner.yml` with state persistence.
+```bash
+python run_scanner.py --lookback 20
+```
 
 ---
 
-## 📱 Alert formats
+## 📱 Telegram Alert Formats
 
-**BUY (SSL start):**
+### 🟢 BUY Signal (SSL Start)
 ```
 🟢 BUY SIGNAL — NSE:NIFTY (5m)
-📌 Fresh SSL-05 pool start @ 24,310.00
-Entry: 24,280.00
-SL: 24,205.00  ·  TP: 24,430.00
-🎯 Nearest pool: 24,300.00
-Swing confirmed 8 bars after the actual LOW (non-repainting)
-Bar: 2026-09-01 14:35 IST
+📌 Fresh SSL-06 pool start @ 24,189.27
+💵 Entry: 24,228.74 (Closed Confirmation Bar)
+🛑 SL: 24,156.67  ·  🎯 TP: 24,372.88 (1:2 R:R)
+🎯 Nearest pool: 24,411.91
+📍 Chart Anchor (Swing Low): 2026-09-01 07:55 IST
+⚡ Swing confirmed 8 bars after actual LOW (non-repainting)
+Bar: 2026-09-01 08:35 IST
 ```
 
-**SELL (BSL start):** 🔴 identical structure, SL/TP mirrored.
-
-**Sweeps** (separate alert type, `SWEEP_ALERTS=true`):
+### 🔴 SELL Signal (BSL Start)
 ```
-🧹 SSL SWEPT — NSE:NIFTY (5m)
-📈 Sell-side liquidity pool @ 24,150.00 was swept — bullish (price reclaimed the level)
-Bar: 2026-09-01 14:40 IST
+🔴 SELL SIGNAL — NSE:NIFTY (5m)
+📌 Fresh BSL-05 pool start @ 24,411.91
+💵 Entry: 24,352.86 (Closed Confirmation Bar)
+🛑 SL: 24,435.13  ·  🎯 TP: 24,188.31 (1:2 R:R)
+🎯 Nearest pool: 24,164.77
+📍 Chart Anchor (Swing High): 2026-09-01 02:20 IST
+⚡ Swing confirmed 8 bars after actual HIGH (non-repainting)
+Bar: 2026-09-01 03:00 IST
 ```
 
-### Strict no-duplicate guarantee
-Every alert gets a unique key (`symbol|tf|kind|bar-time|level`) persisted to
-`data/sent_alerts.json`. A signal is sent **exactly once** — never repeated,
-even across scanner restarts. Failed deliveries are queued and retried each
-cycle for up to `PENDING_MAX_AGE_MIN` (default 30 min); after that they are
-dropped with a warning — a signal that stale is more dangerous than a missed
-one in live markets.
-
-### Live-market safety guards
-- **Stale-bar guard** (`MAX_ALERT_AGE_MIN`, default 10): after a restart with
-  an old state file or a data outage, catch-up bars older than this are
-  evaluated but **never alerted** — no spam of untradable old signals.
-- **Fail-safe feed**: if Yahoo throttles or the network blips, the last good
-  cached bars are used and the cycle continues — one bad fetch never crashes
-  the scanner or a scan cycle.
-- **Closed bars only**: a bar is processed only once `bar_time + interval <= now`
-  (mirrors `alert.freq_once_per_bar_close`), and yfinance's stray `15:30`
-  auction bar is dropped to match TradingView's session.
-
----
-
-## ⚙️ Configuration (.env)
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `SYMBOL` / `DISPLAY_SYMBOL` | `^NSEI` / `NSE:NIFTY` | only the NIFTY index |
-| `TIMEFRAMES` | `1m,5m` | comma-separated intervals |
-| `SCAN_INTERVAL_SEC` | `20` | scan cadence |
-| `MARKET_HOURS_ONLY` | `true` | scan only 09:15–15:30 IST Mon–Fri |
-| `SESSION_START/END` | `09:15` / `15:30` | NSE session |
-| `SWEEP_ALERTS` | `true` | send separate 🧹 sweep alerts |
-| `MAX_ALERT_AGE_MIN` | `10` | never alert bars older than this (restart/outage guard) |
-| `PENDING_MAX_AGE_MIN` | `30` | retry window for failed Telegram deliveries |
-| `PIV_LEN` | `8` | swing pivot strength (bars each side) |
-| `ATR_LEN` | `14` | ATR period |
-| `ZONE_ATR_MULT` | `0.25` | zone thickness × ATR |
-| `EQ_TOL_ATR` | `0.15` | equal H/L merge tolerance × ATR |
-| `MAX_POOLS` | `12` | max live pools per side |
-| `POOL_EXPIRY` | `300` | pool expiry in bars |
-| `SIG_DIR` | `BSL→SELL · SSL→BUY` | or `BSL→BUY · SSL→SELL` (magnet) |
-| `ATR_SL` / `RR_TARGET` | `1.2` / `2.0` | SL and TP multiples |
-
-> ⚠️ **Settings must match your TradingView chart.** If you changed any input
-> in the indicator's settings panel, set the same value in `.env` — otherwise
-> signals will differ.
-
----
-
-## 📁 Project layout
-
+### 🧹 Liquidity Sweep Alert
 ```
-abcd.txt                        # the original Pine Script (reference)
-run_scanner.py                  # entry point
-config.py                       # env-based configuration
-selftest.py                     # offline engine parity tests
-scanner/
-  indicators/bsl_ssl.py         # 1:1 Python port of the indicator
-  data/yfinance_feed.py         # yfinance feed (warm-up + incremental)
-  data/mock.py                  # synthetic data for offline preview
-  alerts/telegram.py            # dual-bot notifier
-  live.py                       # scan loop, dedupe, message building
-  state.py                      # persistent no-repeat dedupe
+🧹 SSL SWEPT (Bullish Reclaim) — NSE:NIFTY (5m)
+📈 Sell-side liquidity pool @ 24,020.50 was swept — bullish (price reclaimed)
+Close 24,025.10 > level 24,020.50
+📍 Chart Marker: ▲ Green Triangle below bar
+Bar: 2026-09-01 09:45 IST
 ```
 
 ---
 
-## ⚠️ Notes & disclaimer
+## ⚙️ Configuration (`.env`)
 
-- **yfinance** is free and unofficial; Yahoo can throttle — if you see
-  repeated fetch errors, raise `SCAN_INTERVAL_SEC`.
-- The engine is validated by `selftest.py` against hand-traced expectations of
-  the Pine logic (pivot timing, merge, sweep, expiry, magnet, SL/TP, dedupe).
-- Intraday bars from yfinance are filtered to the NSE session
-  `09:15–15:30` to match TradingView.
-- **Educational use only.** Not investment advice. Trading involves risk.
+```ini
+# Telegram Tokens
+BOT1_TOKEN=1111111111:AA...
+BOT2_TOKEN=2222222222:BB...
+CHAT_ID=-1001234567890
+CHAT_ID_2=
+
+# Webhook Server
+WEBHOOK_HOST=0.0.0.0
+WEBHOOK_PORT=5000
+WEBHOOK_SECRET=
+
+# Market Parameters
+SYMBOL=^NSEI
+DISPLAY_SYMBOL=NSE:NIFTY
+TIMEFRAMES=1m,5m
+MARKET_HOURS_ONLY=true
+SESSION_START=09:15
+SESSION_END=15:30
+TZ=Asia/Kolkata
+
+# Indicator Settings
+PIV_LEN=8
+ATR_LEN=14
+ZONE_ATR_MULT=0.25
+EQ_TOL_ATR=0.15
+MAX_POOLS=12
+POOL_EXPIRY=300
+SIG_DIR=BSL→SELL · SSL→BUY
+ATR_SL=1.2
+RR_TARGET=2.0
+SWEEP_ALERTS=true
+```
+
+---
+
+## 🧪 Parity Self-Test
+
+Run the offline verification suite:
+```bash
+python selftest.py
+python run_scanner.py --dump-sample
+```

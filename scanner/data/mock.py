@@ -1,95 +1,72 @@
-"""Synthetic OHLC data + streaming MockFeed for offline testing.
+"""Synthetic OHLC feed for offline previews and self-tests.
 
-`make_mock_bars()`  -> deterministic dataframe with clear swing highs/lows,
-                       equal-high merges and sweeps, so every alert type can
-                       be previewed without a network connection.
-`MockFeed`          -> feed-compatible object that "streams" those bars:
-                       each get_bars() call reveals one more closed bar,
-                       so `run_scanner.py --mock` emits alerts progressively
-                       exactly like a live session.
+Generates deterministic NIFTY-like 1m/5m bars (seeded RNG) with a gentle
+trend + volatility waves, plus a few sharp swing spikes so the BSL/SSL engine
+produces real pools, sweeps and signals without any network access.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+import math
 
 import numpy as np
 import pandas as pd
 
-from scanner.data.yfinance_feed import INTERVAL_DELTA
+# NIFTY-ish starting level so messages look realistic
+BASE = 24300.0
+RNG_SEED = 7
 
-TZ = "Asia/Kolkata"
+INTERVAL_DELTA = {
+    "1m": pd.Timedelta(minutes=1),
+    "5m": pd.Timedelta(minutes=5),
+}
 
 
-def make_mock_bars(n: int = 420, tf: str = "5m", end: datetime | None = None) -> pd.DataFrame:
-    """Deterministic synthetic series with engineered liquidity events."""
-    rng = np.random.default_rng(42)
-    delta = INTERVAL_DELTA.get(tf, pd.Timedelta(minutes=5))
+def make_mock_bars(n: int = 300, tf: str = "5m") -> pd.DataFrame:
+    """Deterministic synthetic OHLC bars, tz-aware Asia/Kolkata index.
 
-    if end is None:
-        end_ts = pd.Timestamp.now(tz=TZ).floor(delta)
-    else:
-        end_ts = pd.Timestamp(end)
-        end_ts = end_ts.tz_localize(TZ) if end_ts.tz is None else end_ts.tz_convert(TZ)
-    idx = pd.date_range(end=end_ts, periods=n, freq=delta, tz=TZ)
+    Sine + drift price path with a few engineered swing spikes (high above the
+    path, low below it) so pivot-based pools reliably form.
+    """
+    rng = np.random.default_rng(RNG_SEED)
+    freq = {"1m": "1min", "5m": "5min"}.get(tf, "5min")  # pandas>=2.2 alias
+    idx = pd.date_range("2026-08-31 09:15", periods=n, freq=freq,
+                        tz="Asia/Kolkata")
+    t = np.arange(n)
+    path = BASE + 60 * np.sin(t / 25.0) + t * 0.5 + rng.normal(0, 12, n).cumsum() * 0.3
+    amp = 25 + 8 * np.abs(np.sin(t / 40.0))
 
-    base = 24_300.0
-    drift = np.cumsum(rng.normal(0.0, 6.0, n))
-    close = base + drift
-    spread = np.abs(rng.normal(8.0, 3.0, n)) + 2.0
-    high = close + spread * 0.6
-    low = close - spread * 0.6
-    open_ = close + rng.normal(0.0, 2.0, n)
+    open_ = np.roll(path, 1)
+    open_[0] = path[0]
+    close = path
+    high = np.maximum(open_, close) + amp
+    low = np.minimum(open_, close) - amp
 
-    def spike_high(i: int, px: float, close_at: float | None = None):
-        high[i] = px
-        if close_at is not None:
-            close[i] = close_at
+    # engineered swing spikes -> guaranteed pools/sweeps for previews
+    high[40] += 130.0
+    low[70] -= 130.0
+    high[120] += 90.0
+    low[160] -= 90.0
 
-    def spike_low(i: int, px: float, close_at: float | None = None):
-        low[i] = px
-        if close_at is not None:
-            close[i] = close_at
-
-    # engineered events (well inside the series, away from the warm-up edge)
-    for k in range(0, n - 80, 90):
-        o = 60 + k
-        spike_high(o, close[o] + 90.0)                     # fresh BSL -> SELL
-        spike_low(o + 25, close[o + 25] - 90.0)            # fresh SSL -> BUY
-        # sweep the BSL: trade through, close back below
-        spike_high(o + 45, high[o] + 25.0, close_at=high[o] - 40.0)
-        # sweep the SSL: trade through, close back above
-        spike_low(o + 55, low[o + 25] - 25.0, close_at=low[o + 25] + 40.0)
-
-    high = np.maximum.reduce([high, open_, close])
-    low = np.minimum.reduce([low, open_, close])
-
-    return pd.DataFrame(
-        {"open": open_, "high": high, "low": low, "close": close,
-         "volume": rng.integers(10_000, 90_000, n).astype(float)},
-        index=idx,
-    )
+    df = pd.DataFrame({
+        "open": open_, "high": high, "low": low, "close": close,
+        "volume": rng.integers(50_000, 200_000, n),
+    }, index=idx)
+    return df.round(2)
 
 
 class MockFeed:
-    """Streams the synthetic series one bar at a time (per timeframe)."""
+    """Drop-in replacement for YFinanceFeed (same get_bars contract)."""
 
-    def __init__(self, total_bars: int = 420, start_visible: int = 300):
-        self.total_bars = total_bars
-        self.start_visible = start_visible
-        self._full: dict[str, pd.DataFrame] = {}
-        self._visible: dict[str, int] = {}
+    def __init__(self, symbol: str = "^NSEI", tz: str = "Asia/Kolkata",
+                 session_start: str = "09:15", session_end: str = "15:30"):
+        self.symbol = symbol
+        self.tz = tz
+        self._cache: dict[str, pd.DataFrame] = {}
 
-    def get_bars(self, tf: str) -> pd.DataFrame:
-        if tf not in self._full:
-            # Anchor the LAST revealed bar in the past so every revealed bar
-            # is already closed (ts + delta <= now) for the live loop.
-            delta = INTERVAL_DELTA.get(tf, pd.Timedelta(minutes=5))
-            end = pd.Timestamp.now(tz=TZ).floor(delta) - delta * (self.total_bars - self.start_visible + 2)
-            self._full[tf] = make_mock_bars(self.total_bars, tf=tf, end=end)
-            self._visible[tf] = self.start_visible
-
-        k = self._visible[tf]
-        if k < self.total_bars:
-            self._visible[tf] = k + 1
-        return self._full[tf].iloc[: self._visible[tf]].copy()
+    def get_bars(self, tf: str) -> pd.DataFrame | None:
+        df = self._cache.get(tf)
+        if df is None:
+            df = make_mock_bars(tf=tf)
+            self._cache[tf] = df
+        return df

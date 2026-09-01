@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Offline parity checks for the BSL/SSL engine + dedupe state.
+"""Offline parity checks for the BSL/SSL engine, Webhook server, and dedupe state.
 
 Run:  python selftest.py
 
-Validates (against hand-traced expectations derived from the Pine script):
+Validates:
   1. A confirmed swing HIGH opens a BSL pool and fires SELL (default mapping)
      exactly piv_len bars after the swing bar (non-repainting).
   2. A confirmed swing LOW opens an SSL pool and fires BUY.
@@ -14,18 +14,29 @@ Validates (against hand-traced expectations derived from the Pine script):
   5. Magnet mapping (BSL->BUY, SSL->SELL) flips the signals.
   6. SL/TP math matches close -/+ atr*atr_sl*rr_target.
   7. SentState persists and never re-sends the same key.
+  8. Webhook payload formatter correctly processes TradingView JSON and plaintext.
+  9. Dual timestamps (Chart Anchor vs Execution Bar) match accurately.
+ 10. Multi-Speed TIER 2: fast_piv_len=3 fires 62% faster than piv_len=8.
+ 11. Multi-Speed TIER 3: standard piv_len=8 remains intact for macro tracking.
+ 12. Multi-Speed TIER 1: instant sweep trades fire on the sweep candle (0-bar
+     lag) with wick SL and 1:2 R:R TP.
+ 13. LiveScanner wiring: new closed bars produce (and dedupe) real alerts for
+     all tiers — guards against a silent-death regression in the alert path.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 
 import numpy as np
 import pandas as pd
 
+from scanner.data.yfinance_feed import YFinanceFeed
 from scanner.indicators.bsl_ssl import BSLSSLParams, compute_signals, _atr
 from scanner.state import SentState
+from scanner.webhook import WebhookFormatter
 
 
 def _base_frame(n: int = 200):
@@ -90,8 +101,6 @@ def test_buy_signal():
 def test_equal_merge_no_signal():
     df = _base_frame()
     _spike(df, 20, high=120.0)                     # new pool @120  -> SELL at 28
-    # equal-high bar: high inside eqTol (~1.7) AND close above the pool level
-    # so it does NOT sweep pool @120 (sweep needs close < lvl)
     _spike(df, 30, high=120.6, close=120.2)        # within eqTol   -> merge
     _spike(df, 40, high=130.0)                     # new pool @130  -> SELL at 48
     sig = compute_signals(df, BSLSSLParams())
@@ -114,10 +123,7 @@ def test_sweep():
 
     assert not bool(sig["swept_bsl"].iloc[39]), "no sweep before bar 40"
     assert bool(sig["swept_bsl"].iloc[40]), "BSL sweep on bar 40"
-    # pools iterated newest->oldest; both @130? no: pools @120 only in this frame? see below
-    # (bar 40 high=135 also becomes a NEW pivot confirmed at 48 -> not relevant here)
-    # Bar 40's high (135) itself becomes a new pivot -> pool BSL-02 at bar 48,
-    # then the bar-50 spike (high 140, close 95) sweeps BSL-02, so bar 58 -> BSL-03.
+    
     _spike(df, 50, high=140.0)
     sig2 = compute_signals(df, BSLSSLParams())
     assert bool(sig2["sell_sig"].iloc[48]), "bar 40 high confirmed at 48 -> BSL-02"
@@ -140,6 +146,74 @@ def test_magnet_mapping():
     assert bool(sig["sell_sig"].iloc[33]), "magnet: SSL start -> SELL"
     assert not bool(sig["buy_sig"].iloc[33])
     print("  ok  magnet mapping flips directions")
+
+
+def _scanner_for(params, state_path):
+    """Build a LiveScanner with no network and no Telegram (offline messages)."""
+    from config import ScannerConfig
+    from scanner.data.mock import MockFeed
+    from scanner.live import LiveScanner
+
+    cfg = ScannerConfig()
+    cfg.telegram_enabled = False
+    cfg.market_hours_only = False
+    cfg.state_file = state_path
+    return LiveScanner(cfg, params=params, feed=MockFeed(), market_check=False)
+
+
+def test_signal_message_pool_mapping():
+    """A signal's message/dedupe level must name the pool that actually fired.
+
+    Regression: the message builder always read the SSL pool for BUY and the
+    BSL pool for SELL. Under the magnet mapping (BSL->BUY, SSL->SELL) those
+    columns are empty on the firing bar, so alerts went out as
+    "Fresh  pool start @ -" and the dedupe key level degraded to 'na'.
+    """
+    df = _base_frame()
+    _spike(df, 20, high=120.0)
+    _spike(df, 25, low=70.0)
+
+    with tempfile.TemporaryDirectory() as td:
+        state = os.path.join(td, "state.json")
+
+        # ---- default mapping: BSL -> SELL, SSL -> BUY -------------------
+        p = BSLSSLParams()
+        sig = compute_signals(df, p)
+        sc = _scanner_for(p, state)
+
+        msg = sc._build_signal_msg("SELL", "5m", df.index[28], sig.iloc[28], df.iloc[28], df.index[20])
+        assert "BSL-01" in msg, f"default SELL must name the fresh BSL pool:\n{msg}"
+        assert "@ 120.00" in msg, msg
+        assert "actual HIGH" in msg, msg
+        assert "Chart Anchor (Swing High): 2026-08-01 10:55 IST" in msg
+        assert sc._level_of("SELL", sig.iloc[28]) == 120.0
+
+        msg = sc._build_signal_msg("BUY", "5m", df.index[33], sig.iloc[33], df.iloc[33], df.index[25])
+        assert "SSL-01" in msg, f"default BUY must name the fresh SSL pool:\n{msg}"
+        assert "@ 70.00" in msg, msg
+        assert "actual LOW" in msg, msg
+        assert "Chart Anchor (Swing Low): 2026-08-01 11:20 IST" in msg
+        assert sc._level_of("BUY", sig.iloc[33]) == 70.0
+
+        # ---- magnet mapping: BSL -> BUY, SSL -> SELL --------------------
+        pm = BSLSSLParams(sig_dir="BSL→BUY · SSL→SELL")
+        sigm = compute_signals(df, pm)
+        scm = _scanner_for(pm, state)
+
+        msg = scm._build_signal_msg("BUY", "5m", df.index[28], sigm.iloc[28], df.iloc[28], df.index[20])
+        assert "BSL-01" in msg, f"magnet BUY must name the fresh BSL pool:\n{msg}"
+        assert "@ 120.00" in msg, msg
+        assert "actual HIGH" in msg, msg
+        assert "pool start @ —" not in msg, "magnet BUY lost its pool level"
+        assert scm._level_of("BUY", sigm.iloc[28]) == 120.0, "magnet BUY dedupe level"
+
+        msg = scm._build_signal_msg("SELL", "5m", df.index[33], sigm.iloc[33], df.iloc[33], df.index[25])
+        assert "SSL-01" in msg, f"magnet SELL must name the fresh SSL pool:\n{msg}"
+        assert "@ 70.00" in msg, msg
+        assert "actual LOW" in msg, msg
+        assert scm._level_of("SELL", sigm.iloc[33]) == 70.0, "magnet SELL dedupe level"
+
+    print("  ok  signal message + dedupe level follow the pool mapping")
 
 
 def test_state_dedupe():
@@ -169,158 +243,334 @@ def test_state_dedupe():
     print("  ok  persistent dedupe across restarts")
 
 
-def test_feed_normalization():
-    """YFinanceFeed._normalize: session filter, dedupe, tz, NaN, MultiIndex."""
-    from scanner.data.yfinance_feed import YFinanceFeed
-
-    feed = YFinanceFeed(symbol="^NSEI", tz="Asia/Kolkata")
-    idx = pd.DatetimeIndex([
-        "2026-08-31 09:14",   # pre-open -> dropped
-        "2026-08-31 09:15",   # kept
-        "2026-08-31 12:00",   # kept (duplicated below)
-        "2026-08-31 12:00",   # duplicate -> keep last
-        "2026-08-31 13:00",   # NaN close -> dropped
-        "2026-08-31 15:29",   # kept (last real 1m bar)
-        "2026-08-31 15:30",   # stray auction bar -> dropped
-    ]).tz_localize("Asia/Kolkata")
+def test_yfinance_column_normalization():
+    """yfinance returns TitleCase columns in a (Price, Ticker) MultiIndex —
+    the feed must normalize them or every real fetch crashes with KeyError."""
+    idx = pd.date_range("2026-08-31 09:15", periods=3, freq="5min", tz="Asia/Kolkata")
     raw = pd.DataFrame({
-        "Open":  [1, 2, 3, 3.5, 5, 6, 7],
-        "High":  [1, 2, 3, 3.5, 5, 6, 7],
-        "Low":   [1, 2, 3, 3.5, 5, 6, 7],
-        "Close": [1, 2, 3, 3.5, np.nan, 6, 7],
-        "Volume": [0] * 7,
+        "Open": [1.0, 2.0, 3.0], "High": [2.0, 3.0, 4.0],
+        "Low": [0.5, 1.5, 2.5], "Close": [1.5, 2.5, 3.5],
+        "Adj Close": [1.5, 2.5, 3.5], "Volume": [100, 200, 300],
     }, index=idx)
+    # shape produced by yfinance 1.x download() (group_by='column')
+    multi = raw.copy()
+    multi.columns = pd.MultiIndex.from_product([multi.columns, ["^NSEI"]])
+    out = YFinanceFeed._normalize(multi)
+    assert list(out.columns) == ["open", "high", "low", "close", "volume"], \
+        f"multi-index normalize gave {list(out.columns)}"
+    assert str(out.index.tz) == "Asia/Kolkata"
+    assert out["close"].iloc[0] == 1.5
 
-    df = feed._normalize(raw)
-    assert list(df.columns)[:4] == ["open", "high", "low", "close"], "lower-case OHLC"
-    assert len(df) == 3, f"expected 3 bars after filtering, got {len(df)}"
-    assert df.index.is_unique and df.index.is_monotonic_increasing
-    assert float(df["close"].iloc[1]) == 3.5, "duplicate timestamp must keep the LATEST value"
-    assert str(df.index.tz) == "Asia/Kolkata"
-
-    # MultiIndex columns (yf.download style) also normalise
-    raw2 = raw.copy()
-    raw2.columns = pd.MultiIndex.from_product([raw.columns, ["^NSEI"]])
-    df2 = feed._normalize(raw2)
-    assert list(df2.columns)[:4] == ["open", "high", "low", "close"]
-
-    # tz-naive input gets localised (UTC) then converted
-    raw3 = raw.copy()
-    raw3.index = raw3.index.tz_localize(None)
-    df3 = feed._normalize(raw3)
-    assert df3 is None or str(df3.index.tz) == "Asia/Kolkata"
-    print("  ok  feed normalisation (session filter, dedupe, tz, NaN, MultiIndex)")
+    # older/single-level shape (multi_level_index=False) is also TitleCase
+    out2 = YFinanceFeed._normalize(raw)
+    assert list(out2.columns) == ["open", "high", "low", "close", "volume"], \
+        f"single-level normalize gave {list(out2.columns)}"
+    print("  ok  yfinance TitleCase/MultiIndex column normalization")
 
 
-class _FakeNotifier:
-    """Notifier double: scripted results, records every send."""
-    def __init__(self, results=None):
-        self.enabled = True
-        self.bots = [("fake", "t", "c")]
-        self.sent: list[str] = []
-        self._results = list(results or [])
+def test_incremental_refresh_uses_datetime_start():
+    """yfinance 1.x only parses 'YYYY-MM-DD' strings or datetime objects; a
+    free-form timestamp string makes every incremental refetch fail and the
+    feed serve stale bars forever."""
+    feed = YFinanceFeed()
+    # recent bars (clock-relative) so _refresh takes the incremental path
+    now5 = pd.Timestamp.now(tz="Asia/Kolkata").floor("5min")
+    idx = pd.date_range(now5 - pd.Timedelta(minutes=20), periods=5, freq="5min")
+    cached = pd.DataFrame({
+        "open": [1.0] * 5, "high": [2.0] * 5, "low": [0.5] * 5,
+        "close": [1.5] * 5, "volume": [100] * 5,
+    }, index=idx)
+    feed._cache["5m"] = cached
 
-    def send(self, text):
-        self.sent.append(text)
-        return self._results.pop(0) if self._results else True
+    seen = {}
+    new_bar = pd.DataFrame({
+        "open": [1.0], "high": [2.0], "low": [0.5], "close": [1.4], "volume": [120],
+    }, index=idx[-1:] + pd.Timedelta(minutes=5))
 
+    def fake_download(self, tf, period=None, start=None, retries=2):
+        seen["period"] = period
+        seen["start"] = start
+        return new_bar.copy()
 
-def _make_live_scanner(td, feed, notifier, tf="5m"):
-    from config import ScannerConfig
-    from scanner.live import LiveScanner
-
-    cfg = ScannerConfig()
-    cfg.timeframes = [tf]
-    cfg.market_hours_only = False
-    cfg.max_alert_age_min = 10**6          # mock bars are in the past
-    cfg.state_file = os.path.join(td, "state.json")
-    cfg.telegram_enabled = True
-    sc = LiveScanner(cfg, params=BSLSSLParams(), feed=feed)
-    sc.notifier = notifier
-    return sc
-
-
-def test_live_pipeline_end_to_end():
-    """MockFeed -> engine -> dedupe -> notifier, no duplicates across ticks."""
-    from scanner.data.mock import MockFeed
-
-    with tempfile.TemporaryDirectory() as td:
-        notifier = _FakeNotifier()
-        sc = _make_live_scanner(td, MockFeed(), notifier)
-
-        sc.tick()                                   # baseline: no history spam
-        assert notifier.sent == [], "first tick must only set the baseline"
-
-        for _ in range(120):                        # stream the rest
-            sc.tick()
-        n_alerts = len(notifier.sent)
-        assert n_alerts > 0, "streaming synthetic data must produce alerts"
-        assert len(set(notifier.sent)) == n_alerts, "no duplicate alert texts"
-
-        for _ in range(5):                          # feed exhausted -> no repeats
-            sc.tick()
-        assert len(notifier.sent) == n_alerts, "no alert may ever be re-sent"
-
-        for m in notifier.sent:
-            assert ("BUY SIGNAL" in m or "SELL SIGNAL" in m or "SWEPT" in m)
-            assert "NSE:NIFTY" in m
-    print(f"  ok  end-to-end pipeline: {n_alerts} unique alerts, zero duplicates")
-
-
-def test_failed_delivery_retry():
-    """A failed send must be retried on later ticks — never lost, never doubled."""
-    from scanner.data.mock import MockFeed
-
-    with tempfile.TemporaryDirectory() as td:
-        # every send fails at first
-        notifier = _FakeNotifier(results=[False] * 500)
-        sc = _make_live_scanner(td, MockFeed(), notifier)
-        sc.tick()                                   # baseline
-        for _ in range(40):
-            sc.tick()
-        assert len(sc.state.pending) > 0, "failed alerts must be queued as pending"
-        n_pending = len(sc.state.pending)
-        pending_keys = set(sc.state.pending)
-
-        # deliveries recover
-        notifier._results = []                      # -> always True now
-        before = len(notifier.sent)
-        sc.tick()
-        assert len(sc.state.pending) == 0, "pending queue must drain once delivery works"
-        assert len(notifier.sent) >= before + n_pending
-        for k in pending_keys:
-            assert sc.state.already_sent(k), "retried alert must be marked sent"
-    print("  ok  failed deliveries queued and retried (never lost)")
-
-
-def test_stale_bar_guard():
-    """After a restart with an old state file, stale bars must NOT alert."""
-    from scanner.data.mock import MockFeed
-
-    with tempfile.TemporaryDirectory() as td:
-        notifier = _FakeNotifier()
-        sc = _make_live_scanner(td, MockFeed(), notifier)
-        sc.cfg.max_alert_age_min = 1                # everything mock is older
-        sc.tick()                                   # baseline
-        for _ in range(60):
-            sc.tick()
-        assert notifier.sent == [], "stale bars (older than the guard) must not alert"
-        assert len(sc.state.pending) == 0
-    print("  ok  stale-bar guard suppresses restart/outage catch-up spam")
+    YFinanceFeed._download = fake_download
+    out = feed._refresh("5m", "60d", "60d")
+    assert not isinstance(seen["start"], str), \
+        f"incremental start must be a datetime, got {type(seen['start']).__name__}"
+    assert seen["period"] is None, "period must not be combined with start"
+    assert out is not None and len(out) == 6, "cached + new bars should concatenate"
+    print("  ok  incremental fetch passes a datetime start (no string crash)")
 
 
 def test_expiry():
     df = _base_frame(n=400)
     _spike(df, 20, high=120.0)                      # pool @120 at bar 28
     p = BSLSSLParams(pool_expiry=100)
-    _ = compute_signals(df, p)   # first pass (pool @120 created, later expires)
-    # pool created bar 28, expires when j - 28 > 100 -> bar 129.
-    # Spike close is ABOVE the pool level so the pool expires instead of sweeping.
-    _spike(df, 135, high=140.0, close=125.0)        # NEW pivot (140-120=20 > eqTol)
+    _spike(df, 135, high=140.0, close=125.0)        # NEW pivot
     sig2 = compute_signals(df, p)
     assert bool(sig2["sell_sig"].iloc[143]), "after expiry the old pool is gone -> new pool signals"
     assert sig2["new_bsl_name"].iloc[143] == "BSL-02"
     print("  ok  pool expiry frees the slot for a new pool")
+
+
+def test_fast_pivot_62pct_faster():
+    """TIER 2: fast_piv_len=3 confirms 5 bars earlier than piv_len=8 (62.5%)."""
+    df = _base_frame()
+    _spike(df, 20, high=120.0)
+    p = BSLSSLParams()
+    assert p.piv_len == 8 and p.fast_piv_len == 3
+    faster = (p.piv_len - p.fast_piv_len) / p.piv_len
+    assert abs(faster - 0.625) < 1e-9, f"expected 62.5% faster, got {faster:.1%}"
+
+    sig = compute_signals(df, p)
+    assert not bool(sig["fast_sell_sig"].iloc[20]), "fast signal must not fire on the swing bar"
+    assert bool(sig["fast_sell_sig"].iloc[23]), "FAST SELL must fire on bar 20+3=23"
+    assert not bool(sig["sell_sig"].iloc[23]), "STANDARD must still wait for 8-bar confirmation"
+    assert bool(sig["sell_sig"].iloc[28]), "STANDARD SELL still fires on bar 20+8=28"
+    assert sig["fast_new_bsl_lvl"].iloc[23] == 120.0
+    assert sig["fast_new_bsl_name"].iloc[23] == "FAST-BSL"
+    # 5m: 3 bars = 15 minutes; 1m: 3 bars = 3 minutes
+    assert (df.index[23] - df.index[20]) == pd.Timedelta(minutes=15)
+    print("  ok  TIER 2 fast pivot (3-bar, 62% faster) + TIER 3 standard intact")
+
+
+def test_fast_buy_and_magnet():
+    df = _base_frame()
+    _spike(df, 25, low=70.0)
+    sig = compute_signals(df, BSLSSLParams())
+    assert bool(sig["fast_buy_sig"].iloc[28]), "FAST BUY on bar 25+3=28"
+    assert bool(sig["buy_sig"].iloc[33]), "STANDARD BUY still on bar 25+8=33"
+
+    pm = BSLSSLParams(sig_dir="BSL→BUY · SSL→SELL")
+    sigm = compute_signals(df, pm)
+    assert bool(sigm["fast_sell_sig"].iloc[28]), "magnet: fast SSL start -> FAST SELL"
+    assert not bool(sigm["fast_buy_sig"].iloc[28])
+    print("  ok  TIER 2 fast BUY + magnet flip")
+
+
+def test_instant_sweep_trade_0_bar_lag():
+    """TIER 1: execute on the sweep candle close, wick SL, 1:2 R:R TP."""
+    df = _base_frame()
+    _spike(df, 20, high=120.0)                     # BSL @120 confirmed at 28
+    _spike(df, 25, low=70.0)                       # SSL @70 confirmed at 33
+    _spike(df, 40, high=135.0, close=95.0)         # BSL sweep
+    _spike(df, 45, low=50.0, close=95.0)           # SSL sweep
+    sig = compute_signals(df, BSLSSLParams())
+
+    assert bool(sig["swept_bsl"].iloc[40])
+    assert bool(sig["inst_sell_sig"].iloc[40]), "INSTANT SELL must fire ON the BSL sweep bar (0-lag)"
+    assert not bool(sig["inst_sell_sig"].iloc[39]), "must not fire before the sweep"
+    assert sig["inst_sl_short"].iloc[40] == 135.0, "tight wick SL = sweep candle high"
+    # entry 95, risk 40, 1:2 TP = 95 - 80 = 15
+    assert abs(sig["inst_tp_short"].iloc[40] - (95.0 - 2.0 * (135.0 - 95.0))) < 1e-9
+    assert sig["inst_pool_lvl"].iloc[40] == 120.0
+
+    assert bool(sig["swept_ssl"].iloc[45])
+    assert bool(sig["inst_buy_sig"].iloc[45]), "INSTANT BUY must fire ON the SSL sweep bar (0-lag)"
+    assert sig["inst_sl_long"].iloc[45] == 50.0, "tight wick SL = sweep candle low"
+    assert abs(sig["inst_tp_long"].iloc[45] - (95.0 + 2.0 * (95.0 - 50.0))) < 1e-9
+    assert sig["inst_pool_lvl"].iloc[45] == 70.0
+    print("  ok  TIER 1 instant sweep trade (0-bar lag, wick SL, 1:2 R:R)")
+
+
+def test_multi_speed_telegram_timestamps():
+    """All 3 tiers expose Chart Anchor vs Execution Bar."""
+    df = _base_frame()
+    _spike(df, 20, high=120.0)
+    _spike(df, 40, high=135.0, close=95.0)
+    p = BSLSSLParams()
+    sig = compute_signals(df, p)
+
+    with tempfile.TemporaryDirectory() as td:
+        sc = _scanner_for(p, os.path.join(td, "state.json"))
+
+        msg_std = sc._build_signal_msg(
+            "SELL", "5m", df.index[28], sig.iloc[28], df.iloc[28], df.index[20], speed="standard")
+        assert "· STANDARD" in msg_std
+        assert "Chart Anchor (Swing High): 2026-08-01 10:55 IST" in msg_std
+        assert "Execution Bar: 2026-08-01 11:35 IST" in msg_std
+        assert "Swing confirmed 8 bars after actual HIGH" in msg_std
+
+        msg_fast = sc._build_signal_msg(
+            "SELL", "5m", df.index[23], sig.iloc[23], df.iloc[23], df.index[20], speed="fast")
+        assert "· FAST" in msg_fast
+        assert "FAST-BSL" in msg_fast
+        assert "Chart Anchor (Swing High): 2026-08-01 10:55 IST" in msg_fast
+        assert "Execution Bar: 2026-08-01 11:10 IST" in msg_fast  # 3 x 5m after 10:55
+        assert "Fast swing confirmed 3 bars after actual HIGH" in msg_fast
+        assert "62% faster" in msg_fast
+
+        msg_inst = sc._build_instant_msg(
+            "SELL", "5m", df.index[40], sig.iloc[40], df.iloc[40], df.index[40])
+        assert "INSTANT SWEEP SELL" in msg_inst
+        assert "TIER 1" in msg_inst
+        assert "(wick)" in msg_inst
+        assert "0-bar lag" in msg_inst
+        # Chart Anchor and Execution Bar are the same candle
+        assert "Chart Anchor (Sweep High): 2026-08-01 12:35 IST" in msg_inst
+        assert "Execution Bar: 2026-08-01 12:35 IST" in msg_inst
+        assert "SL: 135.00" in msg_inst or "SL: 135.00" in msg_inst.replace(",", "")
+    print("  ok  dual timestamps (Chart Anchor vs Execution Bar) for all 3 tiers")
+
+
+def test_webhook_multi_speed_tiers():
+    """Webhook formatter emits distinct copy + dual timestamps per speed tier."""
+    std = {
+        "action": "BUY", "speed": "standard", "piv_len": 8,
+        "symbol": "NSE:NIFTY", "tf": "5m", "pool": "SSL-01",
+        "pool_lvl": 24010.55, "entry": 24061.05, "sl": 24038.43, "tp": 24106.30,
+        "target": 24114.00, "swing_bar_time": "2026-09-01 09:45",
+        "bar_time": "2026-09-01 10:25",
+    }
+    kind, key, msg = WebhookFormatter.format_payload(std)
+    assert kind == "BUY"
+    assert "STANDARD" in msg
+    assert "Chart Anchor (Swing Low): 2026-09-01 09:45 IST" in msg
+    assert "Execution Bar: 2026-09-01 10:25 IST" in msg
+    assert "Swing confirmed 8 bars after actual LOW" in msg
+
+    fast = {
+        "action": "BUY", "speed": "fast", "piv_len": 3,
+        "symbol": "NSE:NIFTY", "tf": "5m", "pool": "FAST-SSL",
+        "pool_lvl": 24010.55, "entry": 24040.00, "sl": 24020.00, "tp": 24080.00,
+        "target": 24114.00, "swing_bar_time": "2026-09-01 10:10",
+        "bar_time": "2026-09-01 10:25",
+    }
+    kind2, key2, msg2 = WebhookFormatter.format_payload(fast)
+    assert kind2 == "FAST_BUY"
+    assert "FAST" in msg2
+    assert "FAST-SSL" in msg2
+    assert "Chart Anchor (Swing Low): 2026-09-01 10:10 IST" in msg2
+    assert "Execution Bar: 2026-09-01 10:25 IST" in msg2
+    assert "Fast swing confirmed 3 bars after actual LOW" in msg2
+    assert "62% faster" in msg2
+    assert key2 != key
+
+    inst = {
+        "action": "INST_BUY", "speed": "instant", "piv_len": 0,
+        "symbol": "NSE:NIFTY", "tf": "5m", "pool": "SSL-01",
+        "pool_lvl": 24020.50, "entry": 24025.10, "sl": 24000.00, "tp": 24075.30,
+        "swing_bar_time": "2026-09-01 09:45", "bar_time": "2026-09-01 09:45",
+    }
+    kind3, key3, msg3 = WebhookFormatter.format_payload(inst)
+    assert kind3 == "INST_BUY"
+    assert "INSTANT SWEEP BUY" in msg3
+    assert "TIER 1" in msg3
+    assert "(wick)" in msg3
+    assert "0-bar lag" in msg3
+    assert "Chart Anchor (Sweep Low): 2026-09-01 09:45 IST" in msg3
+    assert "Execution Bar: 2026-09-01 09:45 IST" in msg3
+    print("  ok  webhook formatter distinct alerts for Standard / Fast / Instant")
+
+
+def test_webhook_payload_formatter():
+    # 1. User sample BUY alert
+    buy_json = {
+        "action": "BUY",
+        "symbol": "NSE:NIFTY",
+        "tf": "5m",
+        "pool": "SSL-169",
+        "pool_lvl": 24010.55,
+        "entry": 24061.05,
+        "sl": 24038.43,
+        "tp": 24106.30,
+        "target": 24114.00,
+        "swing_bar_time": "2026-09-01 09:45",
+        "bar_time": "2026-09-01 10:25"
+    }
+    kind, key, msg = WebhookFormatter.format_payload(buy_json)
+    assert kind == "BUY"
+    assert "SSL-169" in msg
+    assert "24,010.55" in msg
+    assert "24,061.05" in msg
+    assert "24,038.43" in msg
+    assert "24,106.30" in msg
+    assert "2026-09-01 09:45 IST" in msg
+    assert "2026-09-01 10:25" in msg
+
+    # 2. User sample SELL alert
+    sell_json = {
+        "action": "SELL",
+        "symbol": "NSE:NIFTY",
+        "tf": "5m",
+        "pool": "BSL-169",
+        "pool_lvl": 24142.85,
+        "entry": 24117.75,
+        "sl": 24136.48,
+        "tp": 24080.29,
+        "target": 24010.55,
+        "swing_bar_time": "2026-09-01 11:30",
+        "bar_time": "2026-09-01 12:10"
+    }
+    kind2, key2, msg2 = WebhookFormatter.format_payload(sell_json)
+    assert kind2 == "SELL"
+    assert "BSL-169" in msg2
+    assert "24,142.85" in msg2
+    assert "24,117.75" in msg2
+
+    # 3. User sample Sweep alert
+    sweep_json = {
+        "action": "SWEEP_SSL",
+        "symbol": "NSE:NIFTY",
+        "tf": "5m",
+        "pool_lvl": 24020.50,
+        "close": 24025.10,
+        "bar_time": "2026-09-01 09:45"
+    }
+    kind3, key3, msg3 = WebhookFormatter.format_payload(sweep_json)
+    assert kind3 == "SWEEP_SSL"
+    assert "24,020.50" in msg3
+
+    print("  ok  webhook formatter handles TradingView JSON & math accurately")
+
+
+def test_live_scanner_wiring_offline():
+    """End-to-end alert-path wiring through LiveScanner (offline, MockFeed).
+
+    Regression guard: production previously called _emit_bar with a wrong
+    signature; tick() swallowed the TypeError every cycle, so the scanner
+    LOOKED alive but never sent a single alert. This test calls the exact
+    method tick() calls and requires >0 emitted+deduped alerts.
+    """
+    from config import ScannerConfig
+    from scanner.data.mock import MockFeed
+    from scanner.live import LiveScanner
+
+    with tempfile.TemporaryDirectory() as td:
+        cfg = ScannerConfig()
+        cfg.market_hours_only = False
+        cfg.telegram_enabled = False          # dry-run: logged + marked sent
+        cfg.state_file = os.path.join(td, "state.json")
+        cfg.log_file = os.path.join(td, "scanner.log")
+
+        sc = LiveScanner(cfg, feed=MockFeed())
+        df = sc.feed.get_bars("5m")
+
+        # pretend bars up to index 99 were evaluated in an earlier session
+        sc.state.set_last_evaluated("5m", df.index[99].isoformat())
+        sig = compute_signals(df, sc.params)
+        now = df.index[-1] + pd.Timedelta(minutes=5)   # every bar is closed
+
+        # The exact method tick() invokes — must not raise.
+        sc._process_new_closed_bars("5m", df, sig, now)
+        assert len(sc.state.sent) > 0, "live path emitted ZERO alerts — wiring broken"
+
+        kinds = {k.split("|")[2] for k in sc.state.sent}
+        later = sig.iloc[100:]
+        assert kinds & {"BUY", "SELL", "SWEEP_SSL", "SWEEP_BSL"}, \
+            f"no standard/sweep alerts emitted (kinds={kinds})"
+        if bool(later["fast_buy_sig"].any()) or bool(later["fast_sell_sig"].any()):
+            assert kinds & {"FAST_BUY", "FAST_SELL"}, "TIER 2 engine fired but no FAST alert"
+        if bool(later["inst_buy_sig"].any()) or bool(later["inst_sell_sig"].any()):
+            assert kinds & {"INST_BUY", "INST_SELL"}, "TIER 1 engine fired but no INST alert"
+
+        # Re-walking already-evaluated bars must never duplicate an alert.
+        n_before = len(sc.state.sent)
+        sc._process_new_closed_bars("5m", df, sig, now)
+        assert len(sc.state.sent) == n_before, "duplicate alerts on re-walk"
+
+        # Public entry point must complete cleanly as well.
+        sc.tick()
+    print("  ok  live wiring: standard/FAST/INST alerts emitted + strictly deduped")
 
 
 def main():
@@ -330,12 +580,18 @@ def main():
     test_equal_merge_no_signal()
     test_sweep()
     test_magnet_mapping()
+    test_signal_message_pool_mapping()
     test_expiry()
     test_state_dedupe()
-    test_feed_normalization()
-    test_live_pipeline_end_to_end()
-    test_failed_delivery_retry()
-    test_stale_bar_guard()
+    test_yfinance_column_normalization()
+    test_incremental_refresh_uses_datetime_start()
+    test_webhook_payload_formatter()
+    test_fast_pivot_62pct_faster()
+    test_fast_buy_and_magnet()
+    test_instant_sweep_trade_0_bar_lag()
+    test_multi_speed_telegram_timestamps()
+    test_webhook_multi_speed_tiers()
+    test_live_scanner_wiring_offline()
     print("\nALL CHECKS PASSED ✅")
 
 

@@ -3,9 +3,13 @@
 
 Usage:
     python run_scanner.py                 # live scan (yfinance + Telegram)
+    python run_scanner.py --webhook       # zero-delay TradingView Webhook listener
     python run_scanner.py --mock          # offline preview on synthetic data
     python run_scanner.py --once          # single scan cycle, then exit
     python run_scanner.py --mock --once   # single offline cycle (no network)
+    python run_scanner.py --lookback 20   # scan last 20m of closed bars, exit
+                                          # (GitHub Actions mode; also set via
+                                          #  LOOKBACK_MINUTES in the env)
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from config import ScannerConfig
 from scanner.data.mock import MockFeed
 from scanner.indicators.bsl_ssl import BSLSSLParams
 from scanner.live import LiveScanner
+from scanner.webhook import WebhookServer
 
 
 def _setup_logging(cfg: ScannerConfig, verbose: bool) -> None:
@@ -43,10 +48,15 @@ def _setup_logging(cfg: ScannerConfig, verbose: bool) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="BSL/SSL liquidity scanner for NSE:NIFTY")
+    ap.add_argument("--webhook", action="store_true",
+                    help="Run TradingView zero-delay Webhook receiver server")
     ap.add_argument("--mock", action="store_true",
                     help="Run on synthetic data (no yfinance/network needed)")
     ap.add_argument("--once", action="store_true",
                     help="Run one scan cycle and exit")
+    ap.add_argument("--lookback", type=int, default=None,
+                    help="Scan the last N minutes of closed bars and exit "
+                         "(defaults to LOOKBACK_MINUTES from the environment)")
     ap.add_argument("--dump-sample", action="store_true",
                     help="Print sample BUY/SELL/sweep Telegram messages (offline) and exit")
     ap.add_argument("--verbose", action="store_true", help="Debug logging")
@@ -55,8 +65,14 @@ def main() -> int:
     cfg = ScannerConfig()
     _setup_logging(cfg, args.verbose)
 
+    if args.webhook:
+        server = WebhookServer(cfg)
+        server.run_forever()
+        return 0
+
     params = BSLSSLParams.from_env()
     feed = MockFeed() if args.mock else None
+    lookback = int(args.lookback if args.lookback is not None else cfg.lookback_minutes)
 
     if args.mock:
         cfg.market_hours_only = False   # synthetic data is always "open"
@@ -64,31 +80,55 @@ def main() -> int:
         if not args.once:
             cfg.scan_interval_sec = min(cfg.scan_interval_sec, 2)  # faster demo
 
-    scanner = LiveScanner(cfg, params=params, feed=feed)
+    scanner = LiveScanner(cfg, params=params, feed=feed,
+                          lookback_minutes=lookback,
+                          market_check=not lookback)
 
     if args.dump_sample:
         from scanner.data.mock import make_mock_bars
         from scanner.indicators.bsl_ssl import compute_signals
         df = make_mock_bars()
         sig = compute_signals(df, params)
-        rows = sig[(sig["buy_sig"]) | (sig["sell_sig"]) | (sig["swept_ssl"]) | (sig["swept_bsl"])]
+        mask = (
+            sig["buy_sig"] | sig["sell_sig"]
+            | sig["fast_buy_sig"] | sig["fast_sell_sig"]
+            | sig["inst_buy_sig"] | sig["inst_sell_sig"]
+            | sig["swept_ssl"] | sig["swept_bsl"]
+        )
+        rows = sig[mask]
         if rows.empty:
             print("No signals found in synthetic data (should not happen).")
             return 1
         print("=" * 60)
         print("SAMPLE TELEGRAM MESSAGES (offline, from synthetic data)")
+        print("Multi-Speed: STANDARD / FAST / INSTANT")
         print("=" * 60)
-        for ts, row in list(rows.iterrows())[-6:]:
+        for ts, row in list(rows.iterrows())[-10:]:
             bar = df.loc[ts]
+            try:
+                pos = df.index.get_loc(ts)
+                actual_ts = df.index[pos - params.piv_len] if pos >= params.piv_len else None
+                fast_ts = df.index[pos - params.fast_piv_len] if pos >= params.fast_piv_len else None
+            except Exception:
+                actual_ts = None
+                fast_ts = None
             msgs = []
             if bool(row["buy_sig"]):
-                msgs.append(scanner._build_signal_msg("BUY", "5m", ts, row, bar))
+                msgs.append(scanner._build_signal_msg("BUY", "5m", ts, row, bar, actual_ts, speed="standard"))
             if bool(row["sell_sig"]):
-                msgs.append(scanner._build_signal_msg("SELL", "5m", ts, row, bar))
+                msgs.append(scanner._build_signal_msg("SELL", "5m", ts, row, bar, actual_ts, speed="standard"))
+            if bool(row["fast_buy_sig"]):
+                msgs.append(scanner._build_signal_msg("BUY", "5m", ts, row, bar, fast_ts, speed="fast"))
+            if bool(row["fast_sell_sig"]):
+                msgs.append(scanner._build_signal_msg("SELL", "5m", ts, row, bar, fast_ts, speed="fast"))
+            if bool(row["inst_buy_sig"]):
+                msgs.append(scanner._build_instant_msg("BUY", "5m", ts, row, bar, ts))
+            if bool(row["inst_sell_sig"]):
+                msgs.append(scanner._build_instant_msg("SELL", "5m", ts, row, bar, ts))
             if bool(row["swept_ssl"]):
-                msgs.append(scanner._build_sweep_msg("SSL", "5m", ts, row))
+                msgs.append(scanner._build_sweep_msg("SSL", "5m", ts, row, bar))
             if bool(row["swept_bsl"]):
-                msgs.append(scanner._build_sweep_msg("BSL", "5m", ts, row))
+                msgs.append(scanner._build_sweep_msg("BSL", "5m", ts, row, bar))
             print("\n" + "-" * 60)
             for m in msgs:
                 print(m)
@@ -99,10 +139,11 @@ def main() -> int:
         log.warning("No Telegram credentials found — set BOT1_TOKEN/BOT2_TOKEN and CHAT_ID in .env "
                     "(see .env.example). Alerts will only be logged until then.")
 
-    if args.once:
+    if args.once or lookback:
         scanner.tick()
         scanner.state.persist()
-        logging.getLogger("scanner").info("single cycle done")
+        logging.getLogger("scanner").info(
+            "single cycle done%s", " (lookback %dm)" % lookback if lookback else "")
         return 0
 
     scanner.run_forever()
