@@ -68,7 +68,8 @@ class LiveScanner:
     # Never fire more than this many historical bars in one cycle.
     MAX_BACKLOG_BARS = 5
 
-    def __init__(self, cfg, params: BSLSSLParams | None = None, feed=None):
+    def __init__(self, cfg, params: BSLSSLParams | None = None, feed=None,
+                 lookback_minutes: int = 0, market_check: bool = True):
         self.cfg = cfg
         self.params = params or BSLSSLParams.from_env()
         self.tz = ZoneInfo(cfg.tz)
@@ -233,7 +234,9 @@ class LiveScanner:
             # a live scanner. Alert ONLY on closed bars inside the recent
             # lookback window; every alert key still goes through the
             # persistent dedupe, so replaying the window on every fresh run
-            # can never send a duplicate.
+            # can never send a duplicate. The window itself bounds alert age,
+            # so the live-only MAX_ALERT_AGE_MIN guard and the backlog cap do
+            # NOT apply here.
             cutoff = df.index.max() - pd.Timedelta(minutes=self.lookback_minutes)
             new_bars = closed[closed > cutoff]
         else:
@@ -245,25 +248,47 @@ class LiveScanner:
                 log.info("[%s] baseline set at %s (skipping history)", tf, closed[-1])
                 return
 
-        try:
-            threshold = self._to_local_ts(last_ev)
-        except Exception:
-            log.exception("[%s] unreadable last_evaluated %r — re-baselining", tf, last_ev)
-            self.state.set_last_evaluated(tf, closed[-1].isoformat())
-            self.state.persist()
-            return
+            try:
+                threshold = self._to_local_ts(last_ev)
+            except Exception:
+                log.exception("[%s] unreadable last_evaluated %r — re-baselining", tf, last_ev)
+                self.state.set_last_evaluated(tf, closed[-1].isoformat())
+                self.state.persist()
+                return
 
-        new_bars = closed[closed > threshold]
+            new_bars = closed[closed > threshold]
+
+            # Never alert on stale bars (a restart with an old state file, or
+            # a long data outage): a signal that old is dangerous, not
+            # actionable. 0 disables the guard.
+            max_age_min = int(getattr(self.cfg, "max_alert_age_min", 10) or 0)
+            if max_age_min > 0:
+                age_cutoff = pd.Timestamp(now) - pd.Timedelta(minutes=max_age_min)
+                fresh = new_bars[new_bars >= age_cutoff]
+                dropped = len(new_bars) - len(fresh)
+                if dropped:
+                    log.warning("[%s] dropping %d stale bar(s) older than %dm "
+                                "(MAX_ALERT_AGE_MIN)", tf, dropped, max_age_min)
+                new_bars = fresh
+
+            # A feed hiccup (or a very long outage) can hand us a large backlog.
+            # Alerting on stale bars is worse than skipping them in a live market.
+            max_backlog = self.MAX_BACKLOG_BARS
+            if len(new_bars) > max_backlog:
+                log.warning("[%s] %d new closed bars (feed gap?) — only alerting the newest %d",
+                            tf, len(new_bars), max_backlog)
+                new_bars = new_bars[-max_backlog:]
+
         if len(new_bars) == 0:
+            # Advance the cursor past bars that were deliberately skipped
+            # (stale-age filter / backlog cap) so they are not re-examined —
+            # and re-logged — on every following cycle.
+            if not self.lookback_minutes:
+                last = closed[-1].isoformat()
+                if self.state.last_evaluated.get(tf) != last:
+                    self.state.set_last_evaluated(tf, last)
+                    self.state.persist()
             return
-
-        # A feed hiccup (or a very long outage) can hand us a large backlog.
-        # Alerting on stale bars is worse than skipping them in a live market.
-        max_backlog = self.MAX_BACKLOG_BARS
-        if len(new_bars) > max_backlog:
-            log.warning("[%s] %d new closed bars (feed gap?) — only alerting the newest %d",
-                        tf, len(new_bars), max_backlog)
-            new_bars = new_bars[-max_backlog:]
 
         changed = False
         for ts in new_bars:
@@ -278,9 +303,7 @@ class LiveScanner:
             except KeyError:
                 log.warning("[%s] bar %s vanished from the frame — skipping", tf, ts)
                 continue
-            changed |= self._emit_bar(tf, ts, row, bar)
-
-    # ------------------------------------------------------------------
+            changed |= self._emit_bar(tf, ts, row, bar, df)
 
         if self.lookback_minutes:
             if changed:
@@ -291,6 +314,8 @@ class LiveScanner:
                 log.info("[%s] lookback: %d closed bar(s) in window, nothing new to send",
                          tf, len(new_bars))
         else:
+            # new_bars is always a suffix of `closed`, so this also covers any
+            # middle bars skipped by the backlog cap.
             self.state.set_last_evaluated(tf, new_bars[-1].isoformat())
             self.state.persist()
             if changed:
@@ -349,10 +374,15 @@ class LiveScanner:
                 continue
             result = self.notifier.send(text)
             if result is False:
+                # Queue for re-delivery: last_evaluated moves past this bar
+                # after the loop, so without the pending queue a failed alert
+                # would be lost forever (never silently dropped).
+                self.state.add_pending(key, text, ts.isoformat())
+                changed = True
                 if self.lookback_minutes:
-                    log.warning("Alert delivery failed in lookback run, will try next run: %s", key)
+                    log.warning("Alert delivery failed in lookback run, queued for retry: %s", key)
                 else:
-                    log.warning("Alert delivery failed, will retry next cycle: %s", key)
+                    log.warning("Alert delivery failed, queued for retry next cycle: %s", key)
             else:
                 self.state.mark(key)
                 changed = True

@@ -89,6 +89,9 @@ even across scanner restarts. Failed deliveries are retried until delivered.
 | `MARKET_HOURS_ONLY` | `true` | scan only 09:15–15:30 IST Mon–Fri |
 | `SESSION_START/END` | `09:15` / `15:30` | NSE session |
 | `SWEEP_ALERTS` | `true` | send separate 🧹 sweep alerts |
+| `MAX_ALERT_AGE_MIN` | `10` | never alert on closed bars older than this (live mode; 0 = off) |
+| `PENDING_MAX_AGE_MIN` | `30` | retry failed Telegram deliveries this long, then drop |
+| `WEBHOOK_HOST` / `WEBHOOK_PORT` / `WEBHOOK_SECRET` | `0.0.0.0` / `5000` / — | webhook receiver binding + shared secret |
 | `PIV_LEN` | `8` | swing pivot strength (bars each side) |
 | `ATR_LEN` | `14` | ATR period |
 | `ZONE_ATR_MULT` | `0.25` | zone thickness × ATR |
@@ -158,7 +161,7 @@ Run this a few minutes before 09:15 IST — it catches every failure mode that
 would otherwise surface as a missed signal:
 
 ```bash
-python selftest.py                 # 12 checks: engine parity + live hardening
+python selftest.py                 # 18 checks: engine parity + live hardening
 python run_scanner.py --once       # verifies feed + Telegram tokens, sets baseline
 tail -f logs/scanner.log
 ```

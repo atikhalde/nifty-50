@@ -3,10 +3,12 @@
 Design goals (live-market safety):
   * NEVER raise into the scan loop — every failure returns None and is logged.
   * Normalise whatever yfinance hands back (MultiIndex columns, naive index,
-    duplicate/uns0rted timestamps, NaN rows) into a clean OHLCV frame with a
+    duplicate/unsorted timestamps, NaN rows) into a clean OHLCV frame with a
     tz-aware Asia/Kolkata index.
-  * Short-TTL cache so a 20 s scan cadence does not hammer Yahoo, and a
-    stale-data guard so we never re-run the engine on a frozen feed silently.
+  * Short-TTL cache + INCREMENTAL refresh (only the bars after the newest
+    cached one are re-downloaded) so a 20 s scan cadence does not hammer
+    Yahoo, plus a stale-data guard so we never re-run the engine on a frozen
+    feed silently.
   * Bounded retries with backoff on transient network errors.
 """
 
@@ -91,7 +93,7 @@ class YFinanceFeed:
                 return hit[1]
 
         period = lookback_period or INTERVAL_PERIOD.get(interval, "5d")
-        df = self._download(interval, period)
+        df = self._refresh(interval, period)
         if df is None:
             # Serve the last good frame rather than blinding the scanner.
             with self._lock:
@@ -108,7 +110,39 @@ class YFinanceFeed:
         return df
 
     # ------------------------------------------------------------------
-    def _download(self, interval: str, period: str):
+    def _refresh(self, interval: str, period: str):
+        """Return the freshest frame for `interval`, extending the cached one.
+
+        With a warm cache only the bars after the newest cached bar are
+        downloaded (one bar of overlap so Yahoo can still revise the
+        previously-open bar), then concatenated onto the cached frame. Cold
+        cache -> one full `period` download.
+
+        yfinance 1.x only accepts a `datetime` (or a 'YYYY-MM-DD' string) for
+        `start`; a free-form timestamp string makes every incremental refetch
+        fail, which would pin the scanner to stale bars forever. The start we
+        pass is therefore always a real datetime, and `period` is never
+        combined with `start` (yfinance rejects that combination).
+        """
+        with self._lock:
+            hit = self._cache.get(interval)
+        cached = hit[1] if hit is not None else None
+
+        if cached is not None and not cached.empty:
+            delta = INTERVAL_DELTA.get(interval, pd.Timedelta(minutes=5))
+            start = cached.index[-1] - delta
+            fresh = self._download(interval, period=None, start=start, expect_few=True)
+            if fresh is None:
+                return None          # caller serves the last good cached frame
+            combined = pd.concat([cached, fresh])
+            combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+            return combined
+
+        return self._download(interval, period)
+
+    # ------------------------------------------------------------------
+    def _download(self, interval: str, period: str | None = None,
+                  start=None, expect_few: bool = False):
         last_exc: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -118,6 +152,7 @@ class YFinanceFeed:
                     tickers=self.symbol,
                     period=period,
                     interval=interval,
+                    start=start,
                     auto_adjust=False,
                     prepost=False,
                     progress=False,
@@ -125,8 +160,9 @@ class YFinanceFeed:
                 )
                 df = self._normalise(raw)
                 if df is None or df.empty:
-                    raise FeedError(f"empty frame for {self.symbol} {interval}/{period}")
-                if len(df) < MIN_BARS:
+                    raise FeedError(f"empty frame for {self.symbol} {interval}/"
+                                    f"{f'start={start}' if start else period}")
+                if len(df) < MIN_BARS and not expect_few:
                     log.warning("[%s] only %d bars returned (need >= %d) — "
                                 "signals may warm up slowly", interval, len(df), MIN_BARS)
                 return df
