@@ -1,18 +1,22 @@
 """Live scanner: yfinance feed -> BSL/SSL engine -> strict-dedupe -> dual Telegram.
 
-This version is 100% parity with the Pine script `abcd.txt`:
+This version is 100% parity with the Pine script `abcd.txt`, plus Multi-Speed tiers:
   * ATR = Wilder RMA of TR (ta.atr)
   * Pivots = ta.pivothigh/low(_, pivLen, pivLen) -> signal fires pivLen bars after actual swing (non-repainting)
   * Pool lifecycle = create -> sweep -> touch -> expiry (same order as Pine)
   * Signal mapping = default fade BSL->SELL, SSL->BUY, magnet flips
   * SL/TP = close ∓ atr*atrSL / close ± atr*atrSL*rrTarget
+  * Multi-Speed:
+    - TIER 1 INSTANT — 0-bar lag on sweep candle close, wick SL, 1:2 R:R TP
+    - TIER 2 FAST    — fast_piv_len=3 (15m on 5m / 3m on 1m), 62% faster entries
+    - TIER 3 STANDARD — original piv_len=8 intact for macro target tracking
   * Telegram message EXACTLY matches chart indicator's label values:
     - pool name, pool level (actual swing high/low)
-    - entry = close of confirmation bar
-    - SL/TP from ATR at confirmation bar
+    - entry = close of confirmation (or sweep) bar
+    - SL/TP from ATR at confirmation bar (standard/fast) or wick (instant)
     - nearest pool = nextBSL/nextSSL (default) or pool itself (magnet) -> matches Pine's buyTgt/sellTgt
     - swing confirmation text with HIGH/LOW based on mapping
-    - BOTH actual swing bar time AND confirmation bar time (Pine label anchored at actual, alert fires at confirmation)
+    - BOTH Chart Anchor time AND Execution Bar time for all 3 speed tiers
 
 If chart and scanner still differ, check:
   1. .env settings must match TradingView inputs (PIV_LEN, ZONE_ATR_MULT, EQ_TOL_ATR, MAX_POOLS, POOL_EXPIRY, ATR_SL, RR_TARGET, SIG_DIR)
@@ -88,9 +92,10 @@ class LiveScanner:
     # main loop
     # ------------------------------------------------------------------
     def run_forever(self) -> None:
-        log.info("BSL/SSL scanner started | symbol=%s | tf=%s | interval=%ss | pivLen=%s | sigDir=%s",
+        log.info("BSL/SSL scanner started | symbol=%s | tf=%s | interval=%ss | pivLen=%s | fastPiv=%s | sigDir=%s",
                  self.cfg.display_symbol, ",".join(self.cfg.timeframes),
-                 self.cfg.scan_interval_sec, self.params.piv_len, self.params.sig_dir)
+                 self.cfg.scan_interval_sec, self.params.piv_len,
+                 self.params.fast_piv_len, self.params.sig_dir)
         if not self.notifier.enabled:
             log.info("Telegram is DISABLED — alerts will only be logged (dry-run).")
         try:
@@ -165,15 +170,7 @@ class LiveScanner:
         for ts in new_bars:
             row = sig.loc[ts]
             bar = df.loc[ts]
-            # Actual swing bar = confirmation bar - piv_len (Pine: bar_index - pivLen)
-            # This is where Pine draws the label, while alert fires at confirmation bar
-            try:
-                pos = df.index.get_loc(ts)
-                actual_pos = pos - self.params.piv_len
-                actual_ts = df.index[actual_pos] if actual_pos >= 0 else None
-            except Exception:
-                actual_ts = None
-            changed |= self._emit_bar(tf, ts, row, bar, actual_ts, df)
+            changed |= self._emit_bar(tf, ts, row, bar, df)
 
         if self.lookback_minutes:
             if changed:
@@ -230,87 +227,105 @@ class LiveScanner:
             return row["new_bsl_lvl"] if magnet else row["new_ssl_lvl"]
         if kind == "SELL":
             return row["new_ssl_lvl"] if magnet else row["new_bsl_lvl"]
-        if kind == "SWEEP_SSL":
+        if kind == "FAST_BUY":
+            return row["fast_new_bsl_lvl"] if magnet else row["fast_new_ssl_lvl"]
+        if kind == "FAST_SELL":
+            return row["fast_new_ssl_lvl"] if magnet else row["fast_new_bsl_lvl"]
+        if kind in ("INST_BUY", "SWEEP_SSL"):
             return row["swept_ssl_lvl"]
-        if kind == "SWEEP_BSL":
+        if kind in ("INST_SELL", "SWEEP_BSL"):
             return row["swept_bsl_lvl"]
         return float("nan")
 
     # ------------------------------------------------------------------
     # message builders - EXACTLY match Pine chart indicator
     # ------------------------------------------------------------------
-    def _build_signal_msg(self, side: str, tf, ts, row, bar, actual_ts) -> str:
+    def _build_signal_msg(self, side: str, tf, ts, row, bar, actual_ts, speed: str = "standard") -> str:
         """
         Build telegram message that EXACTLY matches Pine indicator's label + alert.
 
-        Pine label (anchored at actual swing bar):
-          BUY · SSL-05 start
-          Entry 24280.00
-          SL 24205.00
-          TP 24430.00
-          → pool 24300.00
+        Dual timestamps on every speed tier:
+          Chart Anchor  = where the Pine label is drawn (actual swing bar)
+          Execution Bar = when the alert fires (confirmation bar)
 
-        Pine alert:
-          BUY [SSL-05 START] pool @ 24310.00 | Entry 24280.00 SL 24205.00 TP 24430.00 | swing confirmed 8 bars after the actual low
-
-        Our telegram combines both and adds bar times for 100% traceability:
-          - pool name + level (actual swing high/low)
-          - entry = close of confirmation bar (Pine's close)
-          - SL/TP = close ∓ atr*1.2 / close ± atr*1.2*2.0 (Pine's slLong/tpLong)
-          - nearest pool = nextBSL/nextSSL (default) or pool itself (magnet) = Pine's buyTgt/sellTgt
-          - swing confirmed X bars after actual HIGH/LOW (non-repainting) with actual bar time
-          - confirmation bar time (when signal fires) + actual swing bar time (where label is drawn)
+        speed="standard" (TIER 3): piv_len confirmation, ATR SL/TP, macro next-pool target
+        speed="fast"     (TIER 2): fast_piv_len confirmation (62% faster), ATR SL/TP,
+                                   still aims at the standard (piv_len=8) macro pool
         """
         sym = self.cfg.display_symbol
         entry = float(bar["close"])
+        is_fast = speed == "fast"
+        lag = self.params.fast_piv_len if is_fast else self.params.piv_len
+        tag = "FAST" if is_fast else "STANDARD"
 
-        # Pool mapping mirrors the Pine script:
-        #   default (fade):  buyPool = new SSL, sellPool = new BSL
-        #                    buyTgt  = nextBSL, sellTgt  = nextSSL
-        #   magnet:          buyPool = new BSL, sellPool = new SSL
-        #                    buyTgt  = new BSL, sellTgt  = new SSL (the pool itself)
         magnet = self.params.magnet
         if side == "BUY":
-            if magnet:
-                pool_name, pool_lvl = row["new_bsl_name"], row["new_bsl_lvl"]
-                target = row["new_bsl_lvl"]  # Pine: buyTgt = newBSLlvl in magnet mode
-                swing_word = "HIGH"
-                actual_side = "High"
+            if is_fast:
+                if magnet:
+                    pool_name, pool_lvl = row["fast_new_bsl_name"], row["fast_new_bsl_lvl"]
+                    target = row["new_bsl_lvl"] if row.get("new_bsl_lvl") == row.get("new_bsl_lvl") else row["fast_new_bsl_lvl"]
+                    # Prefer the intact standard-book target when present
+                    target = row["next_bsl"] if not (isinstance(row["next_bsl"], float) and math.isnan(row["next_bsl"])) else row["fast_new_bsl_lvl"]
+                    swing_word = "HIGH"
+                    actual_side = "High"
+                else:
+                    pool_name, pool_lvl = row["fast_new_ssl_name"], row["fast_new_ssl_lvl"]
+                    target = row["next_bsl"]
+                    swing_word = "LOW"
+                    actual_side = "Low"
+                sl, tp = row["fast_sl_long"], row["fast_tp_long"]
             else:
-                pool_name, pool_lvl = row["new_ssl_name"], row["new_ssl_lvl"]
-                target = row["next_bsl"]      # Pine: buyTgt = nextBSL in fade mode
-                swing_word = "LOW"
-                actual_side = "Low"
-            sl, tp = row["sl_long"], row["tp_long"]
-            head = f"🟢 BUY SIGNAL — {sym} ({tf})"
+                if magnet:
+                    pool_name, pool_lvl = row["new_bsl_name"], row["new_bsl_lvl"]
+                    target = row["new_bsl_lvl"]
+                    swing_word = "HIGH"
+                    actual_side = "High"
+                else:
+                    pool_name, pool_lvl = row["new_ssl_name"], row["new_ssl_lvl"]
+                    target = row["next_bsl"]
+                    swing_word = "LOW"
+                    actual_side = "Low"
+                sl, tp = row["sl_long"], row["tp_long"]
+            head = f"🟢 BUY SIGNAL — {sym} ({tf}) · {tag}"
         else:  # SELL
-            if magnet:
-                pool_name, pool_lvl = row["new_ssl_name"], row["new_ssl_lvl"]
-                target = row["new_ssl_lvl"]  # Pine: sellTgt = newSSLlvl in magnet
-                swing_word = "LOW"
-                actual_side = "Low"
+            if is_fast:
+                if magnet:
+                    pool_name, pool_lvl = row["fast_new_ssl_name"], row["fast_new_ssl_lvl"]
+                    target = row["next_ssl"]
+                    swing_word = "LOW"
+                    actual_side = "Low"
+                else:
+                    pool_name, pool_lvl = row["fast_new_bsl_name"], row["fast_new_bsl_lvl"]
+                    target = row["next_ssl"]
+                    swing_word = "HIGH"
+                    actual_side = "High"
+                sl, tp = row["fast_sl_short"], row["fast_tp_short"]
             else:
-                pool_name, pool_lvl = row["new_bsl_name"], row["new_bsl_lvl"]
-                target = row["next_ssl"]      # Pine: sellTgt = nextSSL in fade
-                swing_word = "HIGH"
-                actual_side = "High"
-            sl, tp = row["sl_short"], row["tp_short"]
-            head = f"🔴 SELL SIGNAL — {sym} ({tf})"
+                if magnet:
+                    pool_name, pool_lvl = row["new_ssl_name"], row["new_ssl_lvl"]
+                    target = row["new_ssl_lvl"]
+                    swing_word = "LOW"
+                    actual_side = "Low"
+                else:
+                    pool_name, pool_lvl = row["new_bsl_name"], row["new_bsl_lvl"]
+                    target = row["next_ssl"]
+                    swing_word = "HIGH"
+                    actual_side = "High"
+                sl, tp = row["sl_short"], row["tp_short"]
+            head = f"🔴 SELL SIGNAL — {sym} ({tf}) · {tag}"
 
-        # Format times
-        conf_time_str = ts.strftime('%Y-%m-%d %H:%M')
-        actual_time_str = actual_ts.strftime('%Y-%m-%d %H:%M') if actual_ts is not None else None
+        conf_time_str = ts.strftime("%Y-%m-%d %H:%M")
+        actual_time_str = actual_ts.strftime("%Y-%m-%d %H:%M") if actual_ts is not None else None
 
-        # Build message - matches Pine's alert + label + extra traceability
+        entry_note = "Closed Fast Confirmation Bar" if is_fast else "Closed Confirmation Bar"
         lines = [
             head,
             f"📌 Fresh {pool_name} pool start @ {_fmt_inr(pool_lvl)}",
-            f"💵 Entry: {_fmt_inr(entry)} (Closed Confirmation Bar)",
+            f"💵 Entry: {_fmt_inr(entry)} ({entry_note})",
             f"🛑 SL: {_fmt_inr(sl)}  ·  🎯 TP: {_fmt_inr(tp)} (1:2 R:R)",
         ]
-        # Nearest pool - only show if valid (matches Pine's na check)
-        if target is not None and target == target and not math.isnan(target):
-            if magnet:
+        if target is not None and target == target and not math.isnan(float(target) if target is not None else float("nan")):
+            if magnet and not is_fast:
                 lines.append(f"🎯 Target pool: {_fmt_inr(target)}")
             else:
                 lines.append(f"🎯 Nearest pool: {_fmt_inr(target)}")
@@ -318,10 +333,59 @@ class LiveScanner:
         if actual_time_str:
             lines.append(f"📍 Chart Anchor (Swing {actual_side}): {actual_time_str} IST")
 
-        # Swing confirmation - EXACTLY matches Pine's wording
-        lines.append(f"⚡ Swing confirmed {self.params.piv_len} bars after actual {swing_word} (non-repainting)")
+        if is_fast:
+            pct = 0
+            if self.params.piv_len:
+                pct = round(100.0 * (self.params.piv_len - lag) / self.params.piv_len)
+            lines.append(
+                f"⚡ Fast swing confirmed {lag} bars after actual {swing_word} "
+                f"({pct}% faster, non-repainting)"
+            )
+        else:
+            lines.append(
+                f"⚡ Swing confirmed {lag} bars after actual {swing_word} (non-repainting)"
+            )
+        lines.append(f"🕒 Execution Bar: {conf_time_str} IST")
+        # Keep a plain "Bar:" alias so older parsers / tests still match
         lines.append(f"Bar: {conf_time_str} IST")
 
+        return "\n".join(lines)
+
+    def _build_instant_msg(self, side: str, tf, ts, row, bar, actual_ts) -> str:
+        """TIER 1 instant sweep trade: 0-bar lag, tight wick SL, 1:2 R:R TP."""
+        sym = self.cfg.display_symbol
+        entry = float(bar["close"])
+        tstr = ts.strftime("%Y-%m-%d %H:%M")
+        anchor = actual_ts.strftime("%Y-%m-%d %H:%M") if actual_ts is not None else tstr
+
+        def _name(val, fallback):
+            return val if isinstance(val, str) and val else fallback
+
+        if side == "BUY":
+            pool_name = _name(row["swept_ssl_name"] if "swept_ssl_name" in row.index else "", "SSL")
+            pool_lvl = row["swept_ssl_lvl"]
+            sl, tp = row["inst_sl_long"], row["inst_tp_long"]
+            head = f"⚡ INSTANT SWEEP BUY — {sym} ({tf}) · TIER 1"
+            tone = "SSL sweep reclaim (bullish)"
+            actual_side = "Sweep Low"
+        else:
+            pool_name = _name(row["swept_bsl_name"] if "swept_bsl_name" in row.index else "", "BSL")
+            pool_lvl = row["swept_bsl_lvl"]
+            sl, tp = row["inst_sl_short"], row["inst_tp_short"]
+            head = f"⚡ INSTANT SWEEP SELL — {sym} ({tf}) · TIER 1"
+            tone = "BSL sweep rejection (bearish)"
+            actual_side = "Sweep High"
+
+        lines = [
+            head,
+            f"📌 {tone} · {pool_name} @ {_fmt_inr(pool_lvl)}",
+            f"💵 Entry: {_fmt_inr(entry)} (Sweep Candle Close)",
+            f"🛑 SL: {_fmt_inr(sl)} (wick)  ·  🎯 TP: {_fmt_inr(tp)} (1:2 R:R)",
+            f"📍 Chart Anchor ({actual_side}): {anchor} IST",
+            "⚡ 0-bar lag — executed on sweep candle close",
+            f"🕒 Execution Bar: {tstr} IST",
+            f"Bar: {tstr} IST",
+        ]
         return "\n".join(lines)
 
     def _build_sweep_msg(self, side: str, tf, ts, row, bar) -> str:

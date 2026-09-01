@@ -11,11 +11,14 @@ A high-precision Python scanner and Webhook receiver that replicates the Trading
 |---|---|---|
 | **ATR** | `ta.atr(14)` (Wilder RMA of True Range) | Exact `_wilders_rma` with $\alpha = 1/14$ |
 | **Pivot Detection** | `ta.pivothigh(high, 8, 8)` / `ta.pivotlow(low, 8, 8)` | Strict pivot confirmed **8 bars later** (non-repainting) |
+| **Multi-Speed TIER 3** | Standard `pivLen=8` labels + webhook | Original intact swing, macro `nextBSL`/`nextSSL` target tracking |
+| **Multi-Speed TIER 2** | Fast `fastPivLen=3` labels + webhook (15m on 5m, 3m on 1m) | 62% faster entries, same ATR SL/TP, still aims at standard pools |
+| **Multi-Speed TIER 1** | Instant sweep labels on the sweep candle (0-bar lag) | Wick SL + 1:2 R:R TP, executed on sweep close |
 | **Pool Creation** | Fresh swing high $\rightarrow$ BSL, Fresh swing low $\rightarrow$ SSL | Identical; equal swings within `eqTol` merge into existing pool without firing a signal |
 | **Pool Lifecycle** | Sweep (`high > lvl && close < lvl` / `low < lvl && close > lvl`), Touch, Expiry (300 bars), Max 12 pools/side | Same order per bar: create $\rightarrow$ sweep $\rightarrow$ touch $\rightarrow$ expiry $\rightarrow$ signal |
 | **Signal Direction** | Default Fade: BSL $\rightarrow$ **SELL**, SSL $\rightarrow$ **BUY** (Magnet: BSL $\rightarrow$ **BUY**, SSL $\rightarrow$ **SELL**) | Configurable via `SIG_DIR` in `.env` |
 | **SL / TP Math** | `close ∓ atr × 1.2` / `close ± atr × 1.2 × 2.0` | Exact formula using confirmation bar `close` and `atr` |
-| **Timestamps** | Label at Swing Bar (`bar_index - 8`), Alert at Confirmation Bar (`bar_index`) | Telegram shows **BOTH**: Chart Anchor (Swing Bar) & Execution Bar (Confirmation Bar) |
+| **Timestamps** | Label at Swing Bar (`bar_index - pivLen`), Alert at Confirmation / Sweep Bar | Telegram + webhook show **BOTH** for all 3 tiers: Chart Anchor & Execution Bar |
 
 ---
 
