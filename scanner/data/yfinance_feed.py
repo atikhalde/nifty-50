@@ -9,7 +9,8 @@ each scan cycle. Intraday bars are filtered to the NSE session
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -25,6 +26,21 @@ _PRELOAD = {
     # yfinance only serves ~7 days of 1m bars (and 5m bars with a 60d period)
     "1m": ("7d", "7d"),
     "5m": ("60d", "60d"),
+}
+
+# Canonical lowercase column names we need, plus all the aliases yfinance has
+# used over the years (it always returned TitleCase prices; never lowercase).
+_COL_ALIASES = {
+    "open": "open",
+    "high": "high",
+    "low": "low",
+    "close": "close",
+    "volume": "volume",
+    # adjusted variants — never used by the engine, dropped
+    "adj open": None,
+    "adj high": None,
+    "adj low": None,
+    "adj close": None,
 }
 
 
@@ -62,8 +78,11 @@ class YFinanceFeed:
                 # re-download the whole window — yfinance may have revised bars
                 df = self._download(tf, period=period)
             else:
-                start = (last - pd.Timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%S")
-                df = self._download(tf, period=period, start=start)
+                # Incremental fetch: only the last ~10 minutes (yfinance needs a
+                # tz-aware datetime here, NOT a free-form string — its parser
+                # only accepts YYYY-MM-DD or datetime objects).
+                start = last - pd.Timedelta(minutes=10)
+                df = self._download(tf, start=start)
                 if df is not None and not df.empty:
                     df = pd.concat([cached, df])
         if df is None or df.empty:
@@ -72,31 +91,91 @@ class YFinanceFeed:
         self._cache[tf] = df
         return df
 
-    def _download(self, tf: str, period: str = "7d",
-                  start: str | None = None) -> pd.DataFrame | None:
+    def _download(self, tf: str, period: str | None = None,
+                  start: pd.Timestamp | datetime | None = None,
+                  retries: int = 2) -> pd.DataFrame | None:
+        """Download OHLCV bars from yfinance.
+
+        `period` (e.g. "7d"/"60d") is used for the warm-up fetch; `start` (a
+        tz-aware datetime) is used for the incremental fetch. NEVER pass a
+        free-form timestamp string to yfinance — yfinance 1.x only accepts
+        'YYYY-MM-DD' strings or datetime objects (see _parse_user_dt), and a
+        bad `start` silently makes the whole download return an empty frame.
+        """
         import yfinance as yf
-        try:
-            if start:
-                start = (pd.Timestamp(start) + pd.Timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
-                df = yf.download(
-                    self.symbol, interval=tf, period=period,
-                    start=start, progress=False, auto_adjust=False,
-                )
-            else:
-                df = yf.download(
-                    self.symbol, interval=tf, period=period,
-                    progress=False, auto_adjust=False,
-                )
-            return df if df is not None and not df.empty else None
-        except Exception:
-            log.exception("yfinance fetch failed (tf=%s)", tf)
-            return None
+        last_err: Exception | None = None
+        for attempt in range(retries):
+            try:
+                if start is not None:
+                    if period is not None:
+                        # yfinance treats period as the window length measured
+                        # from `start`; the scanner wants "everything from start
+                        # to now", so drop period when start is given.
+                        period = None
+                    df = yf.download(
+                        self.symbol, interval=tf,
+                        start=start, progress=False, auto_adjust=False,
+                    )
+                else:
+                    df = yf.download(
+                        self.symbol, interval=tf, period=period,
+                        progress=False, auto_adjust=False,
+                    )
+                if df is not None and not df.empty:
+                    return df
+                last_err = RuntimeError("empty yfinance response")
+            except Exception as e:                      # noqa: BLE001
+                last_err = e
+            if attempt < retries - 1:
+                log.debug("yfinance fetch failed (tf=%s, attempt %d/%d): %s",
+                          tf, attempt + 1, retries, last_err)
+                time.sleep(1.0 * (attempt + 1))
+        if last_err is not None:
+            log.warning("yfinance fetch failed (tf=%s): %s", tf, last_err)
+        return None
 
     @staticmethod
     def _normalize(df: pd.DataFrame) -> pd.DataFrame:
+        """Normalize any yfinance OHLCV frame.
+
+        yfinance returns TitleCase columns
+        (Open/High/Low/Close/Adj Close/Volume) and, with its default
+        `multi_level_index=True`, wraps them in a (Price, Ticker) MultiIndex.
+        Older/other versions may return single-level or (Ticker, Price)
+        columns. This handles all of them and returns a frame with lowercase
+        open/high/low/close/volume on a tz-aware Asia/Kolkata index.
+        """
+        if df is None or df.empty:
+            return df
+
         if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+            # pick the level that actually contains price names
+            wanted = {c for c, mapped in _COL_ALIASES.items() if mapped}
+            lvl = None
+            for i in range(df.columns.nlevels):
+                vals = {str(v).strip().lower() for v in df.columns.get_level_values(i)}
+                if vals & wanted:
+                    lvl = i
+                    break
+            if lvl is None:
+                lvl = 0
+            df = df.copy()
+            df.columns = df.columns.get_level_values(lvl)
+
+        df = df.copy()
+        df.columns = [str(c).strip().lower() for c in df.columns]
+
+        # keep only known price/volume aliases (drops Adj Close etc.),
+        # then map them to the canonical lowercase names
+        df = df[[c for c in df.columns if _COL_ALIASES.get(c) is not None]]
+        df = df.rename(columns={c: _COL_ALIASES[c] for c in df.columns})
+
+        missing = [c for c in ("open", "high", "low", "close", "volume")
+                   if c not in df.columns]
+        if missing:
+            raise ValueError(f"yfinance response missing columns {missing}")
         df = df[["open", "high", "low", "close", "volume"]].copy()
+
         df = df[~df.index.duplicated(keep="last")]
         df = df.sort_index()
         if df.index.tz is None:

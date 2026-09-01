@@ -24,6 +24,7 @@ import tempfile
 import numpy as np
 import pandas as pd
 
+from scanner.data.yfinance_feed import YFinanceFeed
 from scanner.indicators.bsl_ssl import BSLSSLParams, compute_signals, _atr
 from scanner.state import SentState
 
@@ -158,6 +159,64 @@ def test_state_dedupe():
     print("  ok  persistent dedupe across restarts")
 
 
+def test_yfinance_column_normalization():
+    """yfinance returns TitleCase columns in a (Price, Ticker) MultiIndex —
+    the feed must normalize them or every real fetch crashes with KeyError."""
+    idx = pd.date_range("2026-08-31 09:15", periods=3, freq="5min", tz="Asia/Kolkata")
+    raw = pd.DataFrame({
+        "Open": [1.0, 2.0, 3.0], "High": [2.0, 3.0, 4.0],
+        "Low": [0.5, 1.5, 2.5], "Close": [1.5, 2.5, 3.5],
+        "Adj Close": [1.5, 2.5, 3.5], "Volume": [100, 200, 300],
+    }, index=idx)
+    # shape produced by yfinance 1.x download() (group_by='column')
+    multi = raw.copy()
+    multi.columns = pd.MultiIndex.from_product([multi.columns, ["^NSEI"]])
+    out = YFinanceFeed._normalize(multi)
+    assert list(out.columns) == ["open", "high", "low", "close", "volume"], \
+        f"multi-index normalize gave {list(out.columns)}"
+    assert str(out.index.tz) == "Asia/Kolkata"
+    assert out["close"].iloc[0] == 1.5
+
+    # older/single-level shape (multi_level_index=False) is also TitleCase
+    out2 = YFinanceFeed._normalize(raw)
+    assert list(out2.columns) == ["open", "high", "low", "close", "volume"], \
+        f"single-level normalize gave {list(out2.columns)}"
+    print("  ok  yfinance TitleCase/MultiIndex column normalization")
+
+
+def test_incremental_refresh_uses_datetime_start():
+    """yfinance 1.x only parses 'YYYY-MM-DD' strings or datetime objects; a
+    free-form timestamp string makes every incremental refetch fail and the
+    feed serve stale bars forever."""
+    feed = YFinanceFeed()
+    # recent bars (clock-relative) so _refresh takes the incremental path
+    now5 = pd.Timestamp.now(tz="Asia/Kolkata").floor("5min")
+    idx = pd.date_range(now5 - pd.Timedelta(minutes=20), periods=5, freq="5min")
+    cached = pd.DataFrame({
+        "open": [1.0] * 5, "high": [2.0] * 5, "low": [0.5] * 5,
+        "close": [1.5] * 5, "volume": [100] * 5,
+    }, index=idx)
+    feed._cache["5m"] = cached
+
+    seen = {}
+    new_bar = pd.DataFrame({
+        "open": [1.0], "high": [2.0], "low": [0.5], "close": [1.4], "volume": [120],
+    }, index=idx[-1:] + pd.Timedelta(minutes=5))
+
+    def fake_download(self, tf, period=None, start=None, retries=2):
+        seen["period"] = period
+        seen["start"] = start
+        return new_bar.copy()
+
+    YFinanceFeed._download = fake_download
+    out = feed._refresh("5m", "60d", "60d")
+    assert not isinstance(seen["start"], str), \
+        f"incremental start must be a datetime, got {type(seen['start']).__name__}"
+    assert seen["period"] is None, "period must not be combined with start"
+    assert out is not None and len(out) == 6, "cached + new bars should concatenate"
+    print("  ok  incremental fetch passes a datetime start (no string crash)")
+
+
 def test_expiry():
     df = _base_frame(n=400)
     _spike(df, 20, high=120.0)                      # pool @120 at bar 28
@@ -181,6 +240,8 @@ def main():
     test_magnet_mapping()
     test_expiry()
     test_state_dedupe()
+    test_yfinance_column_normalization()
+    test_incremental_refresh_uses_datetime_start()
     print("\nALL CHECKS PASSED ✅")
 
 
