@@ -46,7 +46,21 @@ class SentState:
 
     def mark(self, key: str) -> None:
         self.sent[key] = True
+        # A delivered alert can never stay in the retry queue.
+        self.pending.pop(key, None)
         self._prune()
+
+    # ------------------------------------------------------------------
+    # retry queue for alerts whose Telegram delivery failed
+    # ------------------------------------------------------------------
+    def add_pending(self, key: str, text: str, queued_iso: str) -> None:
+        """Queue an undelivered alert. Already-sent keys are never re-queued."""
+        if key in self.sent:
+            return
+        self.pending[key] = {"text": text, "queued": queued_iso}
+
+    def drop_pending(self, key: str) -> None:
+        self.pending.pop(key, None)
 
     def _prune(self) -> None:
         """Keep the dedupe ledger bounded.

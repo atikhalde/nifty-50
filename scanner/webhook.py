@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -11,6 +12,7 @@ import os
 import re
 import socketserver
 import threading
+from datetime import datetime, timezone
 from typing import Any
 
 from scanner.alerts.telegram import TelegramNotifier
@@ -59,6 +61,12 @@ class WebhookFormatter:
                     return WebhookFormatter._format_plaintext(payload, default_sym)
             else:
                 return WebhookFormatter._format_plaintext(payload, default_sym)
+
+        # Valid JSON that is not an object (list/number/bool) has no .get() —
+        # treat it as plaintext instead of raising a 500.
+        if not isinstance(payload, dict):
+            return WebhookFormatter._format_plaintext(
+                json.dumps(payload, default=str), default_sym)
 
         action = str(payload.get("action", "")).upper()
         speed = str(payload.get("speed", "")).strip().lower()
@@ -306,7 +314,8 @@ def make_webhook_handler(notifier: TelegramNotifier, state: SentState, secret: s
             # Secret auth check if configured
             if secret:
                 auth_hdr = self.headers.get("X-Webhook-Secret", "")
-                if auth_hdr != secret and f"secret={secret}" not in self.path:
+                if not (hmac.compare_digest(auth_hdr, secret)
+                        or f"secret={secret}" in self.path):
                     self.send_response(401)
                     self.end_headers()
                     self.wfile.write(b'{"error": "Unauthorized"}')
@@ -333,11 +342,19 @@ def make_webhook_handler(notifier: TelegramNotifier, state: SentState, secret: s
                     state.mark(key)
                     state.persist()
                     log.info("Webhook alert delivered to Telegram [%s]: %s", kind, key)
+                    status, body_out = 200, b'{"status": "delivered"}'
+                else:
+                    # Never mark as sent: queue it so the scanner retries.
+                    state.add_pending(key, msg,
+                                      datetime.now(timezone.utc).isoformat())
+                    state.persist()
+                    log.warning("Webhook alert NOT delivered, queued for retry [%s]: %s", kind, key)
+                    status, body_out = 202, b'{"status": "queued_for_retry"}'
 
-                self.send_response(200)
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b'{"status": "delivered"}')
+                self.wfile.write(body_out)
 
             except Exception as e:
                 log.exception("Error processing webhook POST")
