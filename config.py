@@ -40,6 +40,13 @@ class ScannerConfig:
     session_end: str = os.getenv("SESSION_END", "15:30")
     tz: str = os.getenv("TZ", "Asia/Kolkata")
 
+    # --- lookback mode (GitHub Actions / cloud) ---
+    # Each Actions run is a fresh machine: scan the last N minutes of closed
+    # bars every run instead of waiting for new bars. Dedupe still comes from
+    # the cached data/sent_alerts.json, so no alert is ever repeated.
+    # 0 = disabled (live incremental mode).
+    lookback_minutes: int = int(os.getenv("LOOKBACK_MINUTES", "0") or 0)
+
     # --- telegram (both bots receive the SAME alerts) ---
     telegram_enabled: bool = _env_bool("TELEGRAM_ENABLED", True)
     bot1_token: str = os.getenv("BOT1_TOKEN", "")
@@ -49,6 +56,15 @@ class ScannerConfig:
 
     # --- alert options ---
     sweep_alerts: bool = _env_bool("SWEEP_ALERTS", True)
+    # never send signals for bars older than this (restart/outage catch-up guard)
+    max_alert_age_min: int = int(os.getenv("MAX_ALERT_AGE_MIN", "10"))
+    # failed deliveries are retried for up to this long, then dropped with a warning
+    pending_max_age_min: int = int(os.getenv("PENDING_MAX_AGE_MIN", "30"))
+
+    # --- webhook server (zero-delay direct TradingView alerts) ---
+    webhook_host: str = os.getenv("WEBHOOK_HOST", "0.0.0.0")
+    webhook_port: int = int(os.getenv("WEBHOOK_PORT", "5000"))
+    webhook_secret: str = os.getenv("WEBHOOK_SECRET", "")
 
     # --- state / logging ---
     state_file: str = os.getenv("STATE_FILE", "data/sent_alerts.json")

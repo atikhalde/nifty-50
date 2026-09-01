@@ -2,7 +2,8 @@
 
     "BSL / SSL Liquidity Start Signals — v5 LITE"   (see abcd.txt at repo root)
 
-Signal logic replicated 1:1 with the Pine script:
+Signal logic replicated 1:1 with the Pine script, plus a 3-tier Multi-Speed overlay:
+
   * ATR      -> ta.atr(14)  (Wilder RMA of True Range)
   * Pivots   -> ta.pivothigh(high, pivLen, pivLen) / ta.pivotlow(low, pivLen, pivLen).
                 A swing high at bar *i* is CONFIRMED pivLen bars later (bar i+pivLen),
@@ -17,6 +18,11 @@ Signal logic replicated 1:1 with the Pine script:
   * Signals  -> DEFAULT (fade): fresh BSL -> SELL, fresh SSL -> BUY
                 MAGNET       : fresh BSL -> BUY,  fresh SSL -> SELL
   * SL / TP  -> sl = close -/+ atr*atr_sl ; tp = close -/+ atr*atr_sl*rr_target
+
+  Multi-Speed tiers (all three can fire independently on the same tape):
+  * TIER 3 STANDARD  piv_len=8  — original non-repainting swing, macro target tracking
+  * TIER 2 FAST      fast_piv_len=3  — 62% faster entries (15m on 5m, 3m on 1m)
+  * TIER 1 INSTANT   0-bar lag on sweep candle close — wick SL, 1:2 R:R TP
 
 The per-bar order of operations matches the script exactly:
     BSL create -> SSL create -> BSL sweep/touch/expiry -> SSL sweep/touch/expiry
@@ -39,7 +45,8 @@ import pandas as pd
 
 @dataclass
 class BSLSSLParams:
-    piv_len: int = 8              # "Swing pivot strength" (bars left+right)
+    piv_len: int = 8              # TIER 3 "Swing pivot strength" (bars left+right)
+    fast_piv_len: int = 3         # TIER 2 fast swing (15m on 5m, 3m on 1m) — 62% faster
     atr_len: int = 14             # ta.atr length
     zone_atr_mult: float = 0.25   # "Zone thickness (x ATR)"
     eq_tol_atr: float = 0.15      # "Equal H/L tolerance (x ATR)"
@@ -50,6 +57,8 @@ class BSLSSLParams:
     rr_target: float = 2.0        # "Reward:Risk target"
     show_liq: bool = True         # "Enable liquidity engine"
     show_signals: bool = True     # "Show BUY / SELL on new pools"
+    fast_signals: bool = True     # TIER 2 fast-swing entries
+    instant_sweep_trades: bool = True  # TIER 1 0-bar lag sweep trades
 
     @property
     def magnet(self) -> bool:
@@ -70,8 +79,15 @@ class BSLSSLParams:
             except ValueError:
                 return current
 
+        def _get_bool(name: str, current: bool) -> bool:
+            v = os.getenv(name)
+            if v is None or not v.strip():
+                return current
+            return v.strip().lower() in ("1", "true", "yes", "on")
+
         return cls(
             piv_len=_get("PIV_LEN", cls.piv_len, int),
+            fast_piv_len=_get("FAST_PIV_LEN", cls.fast_piv_len, int),
             atr_len=_get("ATR_LEN", cls.atr_len, int),
             zone_atr_mult=_get("ZONE_ATR_MULT", cls.zone_atr_mult, float),
             eq_tol_atr=_get("EQ_TOL_ATR", cls.eq_tol_atr, float),
@@ -80,6 +96,8 @@ class BSLSSLParams:
             sig_dir=_get("SIG_DIR", cls.sig_dir, str),
             atr_sl=_get("ATR_SL", cls.atr_sl, float),
             rr_target=_get("RR_TARGET", cls.rr_target, float),
+            fast_signals=_get_bool("FAST_SIGNALS", cls.fast_signals),
+            instant_sweep_trades=_get_bool("INSTANT_SWEEP_TRADES", cls.instant_sweep_trades),
         )
 
 
@@ -153,8 +171,22 @@ _NA_FLOAT_COLS = (
     "new_bsl_lvl", "new_ssl_lvl", "swept_bsl_lvl", "swept_ssl_lvl",
     "next_bsl", "next_ssl",
     "sl_long", "tp_long", "sl_short", "tp_short",
+    "ph_fast", "pl_fast",
+    "fast_new_bsl_lvl", "fast_new_ssl_lvl",
+    "fast_sl_long", "fast_tp_long", "fast_sl_short", "fast_tp_short",
+    "inst_sl_long", "inst_tp_long", "inst_sl_short", "inst_tp_short",
+    "inst_pool_lvl",
 )
-_BOOL_COLS = ("bsl_start", "ssl_start", "swept_bsl", "swept_ssl", "buy_sig", "sell_sig")
+_BOOL_COLS = (
+    "bsl_start", "ssl_start", "swept_bsl", "swept_ssl", "buy_sig", "sell_sig",
+    "fast_bsl_start", "fast_ssl_start", "fast_buy_sig", "fast_sell_sig",
+    "inst_buy_sig", "inst_sell_sig",
+)
+_NAME_COLS = (
+    "new_bsl_name", "new_ssl_name",
+    "fast_new_bsl_name", "fast_new_ssl_name",
+    "swept_bsl_name", "swept_ssl_name",
+)
 
 
 def compute_signals(df: pd.DataFrame, p: BSLSSLParams | None = None) -> pd.DataFrame:
@@ -170,15 +202,20 @@ def compute_signals(df: pd.DataFrame, p: BSLSSLParams | None = None) -> pd.DataF
     DataFrame (same index as df) with one row per bar and columns:
       ph, pl, atr, zone_h, eq_tol,
       bsl_start, ssl_start, new_bsl_lvl, new_ssl_lvl, new_bsl_name, new_ssl_name,
-      swept_bsl, swept_ssl, swept_bsl_lvl, swept_ssl_lvl,
+      swept_bsl, swept_ssl, swept_bsl_lvl, swept_ssl_lvl, swept_bsl_name, swept_ssl_name,
       next_bsl, next_ssl,
-      buy_sig, sell_sig, sl_long, tp_long, sl_short, tp_short
+      buy_sig, sell_sig, sl_long, tp_long, sl_short, tp_short,
+      ph_fast, pl_fast, fast_bsl_start, fast_ssl_start,
+      fast_new_bsl_lvl, fast_new_ssl_lvl, fast_new_bsl_name, fast_new_ssl_name,
+      fast_buy_sig, fast_sell_sig, fast_sl_long, fast_tp_long, fast_sl_short, fast_tp_short,
+      inst_buy_sig, inst_sell_sig, inst_sl_long, inst_tp_long, inst_sl_short, inst_tp_short,
+      inst_pool_lvl
     """
     p = p or BSLSSLParams()
 
     if df is None or len(df) == 0:
         idx = df.index if df is not None else None
-        cols = list(_NA_FLOAT_COLS) + list(_BOOL_COLS) + ["new_bsl_name", "new_ssl_name"]
+        cols = list(_NA_FLOAT_COLS) + list(_BOOL_COLS) + list(_NAME_COLS)
         return pd.DataFrame(columns=cols, index=idx)
 
     high = df["high"].to_numpy(dtype=float)
@@ -188,6 +225,9 @@ def compute_signals(df: pd.DataFrame, p: BSLSSLParams | None = None) -> pd.DataF
 
     atr = _atr(high, low, close, p.atr_len)
     ph, pl = _pivots(high, low, p.piv_len)
+    ph_f, pl_f = _pivots(high, low, p.fast_piv_len) if p.fast_piv_len > 0 else (
+        np.full(n, np.nan), np.full(n, np.nan)
+    )
 
     # ---- pool storage (mirrors the Pine var arrays) ----
     b_lvl, b_bar, b_tch, b_eq, b_id, b_last, b_str = [], [], [], [], [], [], []
@@ -196,7 +236,7 @@ def compute_signals(df: pd.DataFrame, p: BSLSSLParams | None = None) -> pd.DataF
 
     out = {k: np.full(n, np.nan) for k in _NA_FLOAT_COLS}
     flags = {k: np.zeros(n, dtype=bool) for k in _BOOL_COLS}
-    names = {"new_bsl_name": [""] * n, "new_ssl_name": [""] * n}
+    names = {k: [""] * n for k in _NAME_COLS}
 
     for j in range(n):
         a = float(atr[j])          # may be NaN (first atr_len-1 bars), like Pine
@@ -208,6 +248,8 @@ def compute_signals(df: pd.DataFrame, p: BSLSSLParams | None = None) -> pd.DataF
         out["eq_tol"][j] = eq_tol
         out["ph"][j] = ph[j]
         out["pl"][j] = pl[j]
+        out["ph_fast"][j] = ph_f[j]
+        out["pl_fast"][j] = pl_f[j]
 
         # ------------------------------------------------------------
         # CREATE BUY-SIDE POOL  (fresh confirmed swing high = START)
@@ -280,12 +322,14 @@ def compute_signals(df: pd.DataFrame, p: BSLSSLParams | None = None) -> pd.DataF
         # ------------------------------------------------------------
         swept_bsl = False
         swept_bsl_lvl = np.nan
+        swept_bsl_name = ""
         i = len(b_lvl) - 1
         while i >= 0:
             lvl = b_lvl[i]
             if high[j] > lvl and close[j] < lvl:          # swept
                 swept_bsl = True
                 swept_bsl_lvl = lvl
+                swept_bsl_name = _zone_name(b_eq[i], True, b_id[i])
                 for arr in (b_lvl, b_bar, b_tch, b_eq, b_id, b_last, b_str):
                     arr.pop(i)
             else:
@@ -304,12 +348,14 @@ def compute_signals(df: pd.DataFrame, p: BSLSSLParams | None = None) -> pd.DataF
         # ------------------------------------------------------------
         swept_ssl = False
         swept_ssl_lvl = np.nan
+        swept_ssl_name = ""
         i = len(s_lvl) - 1
         while i >= 0:
             lvl = s_lvl[i]
             if low[j] < lvl and close[j] > lvl:            # swept
                 swept_ssl = True
                 swept_ssl_lvl = lvl
+                swept_ssl_name = _zone_name(s_eq[i], False, s_id[i])
                 for arr in (s_lvl, s_bar, s_tch, s_eq, s_id, s_last, s_str):
                     arr.pop(i)
             else:
@@ -324,7 +370,7 @@ def compute_signals(df: pd.DataFrame, p: BSLSSLParams | None = None) -> pd.DataF
             i -= 1
 
         # ------------------------------------------------------------
-        # START-POINT ENTRY SIGNALS
+        # START-POINT ENTRY SIGNALS  (TIER 3 STANDARD, piv_len)
         # ------------------------------------------------------------
         next_bsl = min((lv for lv in b_lvl if lv > close[j]), default=np.nan)
         next_ssl = max((lv for lv in s_lvl if lv < close[j]), default=np.nan)
@@ -337,6 +383,60 @@ def compute_signals(df: pd.DataFrame, p: BSLSSLParams | None = None) -> pd.DataF
         sl_short = close[j] + a * p.atr_sl
         tp_short = close[j] - a * p.atr_sl * p.rr_target
 
+        # ------------------------------------------------------------
+        # TIER 2 — FAST SWING PIVOTS (fast_piv_len = 3 → 62% faster)
+        # Independent confirmation; macro targets still come from the
+        # intact piv_len=8 pool book (next_bsl / next_ssl).
+        # ------------------------------------------------------------
+        fast_bsl_start = False
+        fast_ssl_start = False
+        fast_new_bsl_lvl = np.nan
+        fast_new_ssl_lvl = np.nan
+        fast_new_bsl_name = ""
+        fast_new_ssl_name = ""
+        if p.show_liq and p.fast_piv_len > 0 and not math.isnan(ph_f[j]):
+            fast_bsl_start = True
+            fast_new_bsl_lvl = float(ph_f[j])
+            fast_new_bsl_name = "FAST-BSL"
+        if p.show_liq and p.fast_piv_len > 0 and not math.isnan(pl_f[j]):
+            fast_ssl_start = True
+            fast_new_ssl_lvl = float(pl_f[j])
+            fast_new_ssl_name = "FAST-SSL"
+
+        fast_buy_sig = (
+            p.show_signals and p.fast_signals
+            and (fast_ssl_start if not p.magnet else fast_bsl_start)
+        )
+        fast_sell_sig = (
+            p.show_signals and p.fast_signals
+            and (fast_bsl_start if not p.magnet else fast_ssl_start)
+        )
+        fast_sl_long = sl_long
+        fast_tp_long = tp_long
+        fast_sl_short = sl_short
+        fast_tp_short = tp_short
+
+        # ------------------------------------------------------------
+        # TIER 1 — INSTANT SWEEP TRADES (0-bar lag)
+        # Execute on the sweep candle close. SL = sweep-candle wick,
+        # TP = 1:2 R:R from that wick risk.
+        # SSL sweep (bullish reclaim) → BUY ; BSL sweep (bearish reject) → SELL
+        # ------------------------------------------------------------
+        inst_buy_sig = bool(p.instant_sweep_trades) and swept_ssl
+        inst_sell_sig = bool(p.instant_sweep_trades) and swept_bsl
+        wick_risk_long = close[j] - low[j]
+        wick_risk_short = high[j] - close[j]
+        inst_sl_long = low[j]
+        inst_tp_long = close[j] + p.rr_target * wick_risk_long
+        inst_sl_short = high[j]
+        inst_tp_short = close[j] - p.rr_target * wick_risk_short
+        if inst_buy_sig:
+            inst_pool_lvl = swept_ssl_lvl
+        elif inst_sell_sig:
+            inst_pool_lvl = swept_bsl_lvl
+        else:
+            inst_pool_lvl = np.nan
+
         out["new_bsl_lvl"][j] = new_bsl_lvl
         out["new_ssl_lvl"][j] = new_ssl_lvl
         out["swept_bsl_lvl"][j] = swept_bsl_lvl
@@ -347,6 +447,17 @@ def compute_signals(df: pd.DataFrame, p: BSLSSLParams | None = None) -> pd.DataF
         out["tp_long"][j] = tp_long
         out["sl_short"][j] = sl_short
         out["tp_short"][j] = tp_short
+        out["fast_new_bsl_lvl"][j] = fast_new_bsl_lvl
+        out["fast_new_ssl_lvl"][j] = fast_new_ssl_lvl
+        out["fast_sl_long"][j] = fast_sl_long
+        out["fast_tp_long"][j] = fast_tp_long
+        out["fast_sl_short"][j] = fast_sl_short
+        out["fast_tp_short"][j] = fast_tp_short
+        out["inst_sl_long"][j] = inst_sl_long
+        out["inst_tp_long"][j] = inst_tp_long
+        out["inst_sl_short"][j] = inst_sl_short
+        out["inst_tp_short"][j] = inst_tp_short
+        out["inst_pool_lvl"][j] = inst_pool_lvl
 
         flags["bsl_start"][j] = bsl_start
         flags["ssl_start"][j] = ssl_start
@@ -354,15 +465,25 @@ def compute_signals(df: pd.DataFrame, p: BSLSSLParams | None = None) -> pd.DataF
         flags["swept_ssl"][j] = swept_ssl
         flags["buy_sig"][j] = buy_sig
         flags["sell_sig"][j] = sell_sig
+        flags["fast_bsl_start"][j] = fast_bsl_start
+        flags["fast_ssl_start"][j] = fast_ssl_start
+        flags["fast_buy_sig"][j] = fast_buy_sig
+        flags["fast_sell_sig"][j] = fast_sell_sig
+        flags["inst_buy_sig"][j] = inst_buy_sig
+        flags["inst_sell_sig"][j] = inst_sell_sig
 
         names["new_bsl_name"][j] = new_bsl_name
         names["new_ssl_name"][j] = new_ssl_name
+        names["fast_new_bsl_name"][j] = fast_new_bsl_name
+        names["fast_new_ssl_name"][j] = fast_new_ssl_name
+        names["swept_bsl_name"][j] = swept_bsl_name
+        names["swept_ssl_name"][j] = swept_ssl_name
 
     res = pd.DataFrame(index=df.index)
     for k, arr in out.items():
         res[k] = arr
     for k, arr in flags.items():
         res[k] = arr
-    res["new_bsl_name"] = names["new_bsl_name"]
-    res["new_ssl_name"] = names["new_ssl_name"]
+    for k, arr in names.items():
+        res[k] = arr
     return res
