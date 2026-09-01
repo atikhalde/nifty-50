@@ -46,7 +46,24 @@ class SentState:
 
     def mark(self, key: str) -> None:
         self.sent[key] = True
+        # An alert that has been delivered no longer needs retrying.
+        self.pending.pop(key, None)
         self._prune()
+
+    # ------------------------------------------------------------------
+    def add_pending(self, key: str, text: str, queued_iso: str) -> None:
+        """Queue an alert whose delivery failed, for retry on a later cycle.
+
+        An alert that was already delivered is never re-queued — the strict
+        no-duplicate guarantee wins over re-delivery.
+        """
+        if key in self.sent:
+            return
+        self.pending[key] = {"text": text, "queued": queued_iso}
+
+    def drop_pending(self, key: str) -> None:
+        """Discard a pending alert (e.g. it aged out past PENDING_MAX_AGE_MIN)."""
+        self.pending.pop(key, None)
 
     def _prune(self) -> None:
         """Keep the dedupe ledger bounded.

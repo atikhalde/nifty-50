@@ -82,7 +82,10 @@ def main() -> int:
 
     scanner = LiveScanner(cfg, params=params, feed=feed,
                           lookback_minutes=lookback,
-                          market_check=not lookback)
+                          # --once is a manual diagnostic cycle: it must check
+                          # the feed and (re)baseline even pre-market, per the
+                          # README pre-market checklist.
+                          market_check=not (lookback or args.once))
 
     if args.dump_sample:
         from scanner.data.mock import make_mock_bars

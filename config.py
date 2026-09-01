@@ -142,7 +142,8 @@ class ScannerConfig:
     # bars every run instead of waiting for new bars. Dedupe still comes from
     # the cached data/sent_alerts.json, so no alert is ever repeated.
     # 0 = disabled (live incremental mode).
-    lookback_minutes: int = int(os.getenv("LOOKBACK_MINUTES", "0") or 0)
+    lookback_minutes: int = field(
+        default_factory=lambda: _env_int("LOOKBACK_MINUTES", 0, lo=0, hi=1440))
 
     # --- telegram (both bots receive the SAME alerts) ---
     telegram_enabled: bool = field(default_factory=lambda: _env_bool("TELEGRAM_ENABLED", True))
@@ -154,6 +155,21 @@ class ScannerConfig:
 
     # --- alert options ---
     sweep_alerts: bool = field(default_factory=lambda: _env_bool("SWEEP_ALERTS", True))
+    # Never send signals for closed bars older than this many minutes
+    # (protects against a restart with an old state file / long data outage).
+    # Applies to live incremental mode only — the lookback window bounds
+    # itself. 0 disables the guard.
+    max_alert_age_min: int = field(
+        default_factory=lambda: _env_int("MAX_ALERT_AGE_MIN", 10, lo=0, hi=1440))
+    # Failed Telegram deliveries are retried for up to this long, then dropped.
+    pending_max_age_min: int = field(
+        default_factory=lambda: _env_int("PENDING_MAX_AGE_MIN", 30, lo=1, hi=1440))
+
+    # --- webhook receiver (Mode 1: zero-delay TradingView alerts) ---
+    webhook_host: str = field(default_factory=lambda: _env_str("WEBHOOK_HOST", "0.0.0.0"))
+    webhook_port: int = field(
+        default_factory=lambda: _env_int("WEBHOOK_PORT", 5000, lo=1, hi=65535))
+    webhook_secret: str = field(default_factory=lambda: _env_str("WEBHOOK_SECRET", ""))
 
     # --- state / logging ---
     state_file: str = field(

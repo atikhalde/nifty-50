@@ -7,10 +7,7 @@ import json
 import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import math
-import os
-import re
 import socketserver
-import threading
 from typing import Any
 
 from scanner.alerts.telegram import TelegramNotifier
@@ -329,10 +326,21 @@ def make_webhook_handler(notifier: TelegramNotifier, state: SentState, secret: s
                     return
 
                 res = notifier.send(msg)
-                if res is not False:
-                    state.mark(key)
-                    state.persist()
-                    log.info("Webhook alert delivered to Telegram [%s]: %s", kind, key)
+                if res is False:
+                    # Delivery failed (and was queued nowhere on this path).
+                    # Answer 5xx so TradingView retries the webhook; the key is
+                    # NOT marked sent, so a successful retry cannot duplicate.
+                    log.error("Webhook alert delivery FAILED (Telegram unreachable/"
+                              "misconfigured): %s", key)
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "delivery_failed"}')
+                    return
+
+                state.mark(key)
+                state.persist()
+                log.info("Webhook alert delivered to Telegram [%s]: %s", kind, key)
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

@@ -1,5 +1,59 @@
 # Deep Analysis: Indicator Chart vs Scanner Telegram Mismatch
 
+## Fix Round 2 — merge-conflict repair & runtime errors (2026-09-01)
+
+The merge in PR #15 left the tree in a half-merged state: the scanner could
+not start at all (`python run_scanner.py` raised `TypeError` immediately).
+Root causes found by deep analysis, all fixed:
+
+1. **`LiveScanner.__init__` signature mangled by the merge** — the body read
+   `lookback_minutes` / `market_check`, but neither was a parameter. Every
+   launch died with `TypeError: unexpected keyword argument`. Both parameters
+   restored (with safe defaults).
+2. **`_process_new_closed_bars` structure broken** — in lookback mode
+   `last_ev` was undefined (`NameError`), and the lookback `new_bars` was
+   overwritten by a dead `threshold` filter below it. Restructured: lookback
+   mode slices purely by window; incremental mode does baseline → threshold →
+   stale-age guard → backlog cap, and advances `last_evaluated` past bars it
+   deliberately skips (no re-log spam).
+3. **`_emit_bar` called without its `df` argument** (`TypeError`) — needed for
+   the Chart-Anchor timestamps. Fixed at the call site.
+4. **Retry queue half-merged** — `live.py` called `state.add_pending()` /
+   `state.drop_pending()` and `selftest.py` tested them, but `state.py` had
+   neither method, and `mark()` never cleared the queue. Added both;
+   `mark()` now pops the pending entry; `_emit_bar` queues failed deliveries
+   so "retried until delivered" actually holds.
+5. **Config keys documented but never read** — `WEBHOOK_HOST/PORT/SECRET`,
+   `MAX_ALERT_AGE_MIN`, `PENDING_MAX_AGE_MIN` were in `.env.example` but
+   missing from `ScannerConfig` (a custom `WEBHOOK_PORT` was silently
+   ignored; `MAX_ALERT_AGE_MIN` was set by `run_scanner.py` onto a field that
+   did not exist). All added with defensive parsing, and the
+   `MAX_ALERT_AGE_MIN` guard is now actually enforced (live mode only — the
+   lookback window bounds itself). `LOOKBACK_MINUTES=abc` no longer crashes.
+6. **`--once` idled outside market hours** — it is a diagnostic cycle
+   (README pre-market checklist) and now always runs once.
+7. **Webhook receiver swallowed delivery failures with HTTP 200** —
+   TradingView would never retry. It now answers 503 on failure and leaves
+   the key unmarked, so a successful retry cannot duplicate.
+8. **Feed re-downloaded a full month of bars every cycle** — added the
+   incremental `_refresh()` (datetime `start`, never combined with `period`,
+   one bar of overlap so Yahoo can revise the previously-open bar).
+9. **`selftest.py` promised checks that did not exist** — the webhook
+   formatter test, TIER 2 fast test and TIER 1 instant test were missing
+   (WebhookFormatter was imported and unused); two orphan tests targeted a
+   `_refresh` API that did not exist and called `_normalise` unbound. All
+   fixed/added — the suite is now 18 checks, all passing.
+10. **Pending CI patch applied** — `patches/0001-…` (market-hours gate that
+    never gated + dedupe cache pinned to the first snapshot) is now applied
+    to `.github/workflows/scanner.yml`; `patches/` removed as its README
+    instructed.
+
+Verified: `python selftest.py` (18/18 ✅), `--mock --once`, `--mock`
+(continuous), `--mock --lookback`, `--dump-sample` (default + magnet
+`SIG_DIR`), webhook server end-to-end (401/200/duplicate/413), corrupt-state
+recovery, `prune_state.py`, and graceful no-network live runs. `pyflakes`
+clean.
+
 ## Problem Reported
 User observed:
 - Chart indicator (Pine v5 `BSL / SSL Liquidity Start Signals — v5 LITE` in `abcd.txt`) shows BUY/SELL signals
