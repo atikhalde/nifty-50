@@ -38,12 +38,16 @@ from scanner.state import SentState
 log = logging.getLogger("scanner")
 
 
-def _fmt_inr(v: float) -> str:
+def _fmt_inr(v: float | None) -> str:
     """Indian-style thousands grouping, e.g. 24,31,050.25"""
     if v is None or (isinstance(v, float) and (math.isnan(v))):
         return "—"
-    neg = v < 0
-    whole, _, dec = f"{abs(v):.2f}".partition(".")
+    try:
+        val = float(v)
+    except (ValueError, TypeError):
+        return str(v)
+    neg = val < 0
+    whole, _, dec = f"{abs(val):.2f}".partition(".")
     if len(whole) > 3:
         head, tail = whole[:-3], whole[-3:]
         groups = []
@@ -298,6 +302,8 @@ class LiveScanner:
                 actual_side = "HIGH"
             sl, tp = row["sl_short"], row["tp_short"]
             head = f"🔴 SELL SIGNAL — {sym} ({tf})"
+            anchor_txt = f"📍 Chart Anchor (Swing HIGH): {swing_ts_str} IST"
+            swing_txt = f"⚡ Swing confirmed {piv_len} bars after actual HIGH (non-repainting)"
 
         swing_txt = (f"Swing confirmed {self.params.piv_len} bars after the "
                      f"actual {swing_word} (non-repainting)")
@@ -310,8 +316,8 @@ class LiveScanner:
         lines = [
             head,
             f"📌 Fresh {pool_name} pool start @ {_fmt_inr(pool_lvl)}",
-            f"Entry: {_fmt_inr(entry)}",
-            f"SL: {_fmt_inr(sl)}  ·  TP: {_fmt_inr(tp)}",
+            f"💵 Entry: {_fmt_inr(entry)} (Closed Confirmation Bar)",
+            f"🛑 SL: {_fmt_inr(sl)}  ·  🎯 TP: {_fmt_inr(tp)} (1:2 R:R)",
         ]
         # Nearest pool - only show if valid (matches Pine's na check)
         if target is not None and target == target and not math.isnan(target):
@@ -338,6 +344,7 @@ class LiveScanner:
         if target is not None and target == target:   # NaN-safe check
             lines.append(f"🎯 Nearest pool: {_fmt_inr(target)}")
         lines += [
+            anchor_txt,
             swing_txt,
             f"Bar: {ts.strftime('%Y-%m-%d %H:%M')} IST",
         ]
@@ -353,16 +360,14 @@ class LiveScanner:
         close = float(bar["close"])
         if side == "SSL":
             lvl = row["swept_ssl_lvl"]
-            tone = "bullish (price reclaimed the level)"
-            head = f"🧹 SSL SWEPT — {sym} ({tf})"
+            head = f"🧹 SSL SWEPT (Bullish Reclaim) — {sym} ({tf})"
             arrow = "📈"
             kind_txt = "Sell-side liquidity pool"
             # Extra detail: close vs level
             detail = f"Close {_fmt_inr(close)} > level {_fmt_inr(lvl)}" if close == close else ""
         else:
             lvl = row["swept_bsl_lvl"]
-            tone = "bearish (price failed above the level)"
-            head = f"🧹 BSL SWEPT — {sym} ({tf})"
+            head = f"🧹 BSL SWEPT (Bearish Rejection) — {sym} ({tf})"
             arrow = "📉"
             kind_txt = "Buy-side liquidity pool"
             detail = f"Close {_fmt_inr(close)} < level {_fmt_inr(lvl)}" if close == close else ""

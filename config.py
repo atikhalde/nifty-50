@@ -57,6 +57,11 @@ class ScannerConfig:
     # --- alert options ---
     sweep_alerts: bool = _env_bool("SWEEP_ALERTS", True)
 
+    # --- webhook server (zero-delay direct TradingView alerts) ---
+    webhook_host: str = os.getenv("WEBHOOK_HOST", "0.0.0.0")
+    webhook_port: int = int(os.getenv("WEBHOOK_PORT", "5000"))
+    webhook_secret: str = os.getenv("WEBHOOK_SECRET", "")
+
     # --- state / logging ---
     state_file: str = os.getenv("STATE_FILE", "data/sent_alerts.json")
     log_file: str = os.getenv("LOG_FILE", "logs/scanner.log")
