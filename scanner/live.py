@@ -68,7 +68,8 @@ class LiveScanner:
     # Never fire more than this many historical bars in one cycle.
     MAX_BACKLOG_BARS = 5
 
-    def __init__(self, cfg, params: BSLSSLParams | None = None, feed=None):
+    def __init__(self, cfg, params: BSLSSLParams | None = None, feed=None,
+                 lookback_minutes: int | None = None, market_check: bool = True):
         self.cfg = cfg
         self.params = params or BSLSSLParams.from_env()
         self.tz = ZoneInfo(cfg.tz)
@@ -90,6 +91,8 @@ class LiveScanner:
         # alerts fire only for closed bars inside the last `lookback_minutes`.
         # Alert dedupe comes from the cached `data/sent_alerts.json` (shared
         # across fresh machines), NOT from last_evaluated.
+        if lookback_minutes is None:
+            lookback_minutes = getattr(cfg, "lookback_minutes", 0)
         self.lookback_minutes = int(lookback_minutes or 0)
         self.market_check = market_check
         # Consecutive per-timeframe cycle failures — escalates to CRITICAL so a
@@ -245,25 +248,25 @@ class LiveScanner:
                 log.info("[%s] baseline set at %s (skipping history)", tf, closed[-1])
                 return
 
-        try:
-            threshold = self._to_local_ts(last_ev)
-        except Exception:
-            log.exception("[%s] unreadable last_evaluated %r — re-baselining", tf, last_ev)
-            self.state.set_last_evaluated(tf, closed[-1].isoformat())
-            self.state.persist()
-            return
+            try:
+                threshold = self._to_local_ts(last_ev)
+            except Exception:
+                log.exception("[%s] unreadable last_evaluated %r — re-baselining", tf, last_ev)
+                self.state.set_last_evaluated(tf, closed[-1].isoformat())
+                self.state.persist()
+                return
 
-        new_bars = closed[closed > threshold]
+            new_bars = closed[closed > threshold]
+
+            # A feed hiccup (or a very long outage) can hand us a large backlog.
+            # Alerting on stale bars is worse than skipping them in a live market.
+            if len(new_bars) > self.MAX_BACKLOG_BARS:
+                log.warning("[%s] %d new closed bars (feed gap?) — only alerting the newest %d",
+                            tf, len(new_bars), self.MAX_BACKLOG_BARS)
+                new_bars = new_bars[-self.MAX_BACKLOG_BARS:]
+
         if len(new_bars) == 0:
             return
-
-        # A feed hiccup (or a very long outage) can hand us a large backlog.
-        # Alerting on stale bars is worse than skipping them in a live market.
-        max_backlog = self.MAX_BACKLOG_BARS
-        if len(new_bars) > max_backlog:
-            log.warning("[%s] %d new closed bars (feed gap?) — only alerting the newest %d",
-                        tf, len(new_bars), max_backlog)
-            new_bars = new_bars[-max_backlog:]
 
         changed = False
         for ts in new_bars:
@@ -278,9 +281,7 @@ class LiveScanner:
             except KeyError:
                 log.warning("[%s] bar %s vanished from the frame — skipping", tf, ts)
                 continue
-            changed |= self._emit_bar(tf, ts, row, bar)
-
-    # ------------------------------------------------------------------
+            changed |= self._emit_bar(tf, ts, row, bar, df)
 
         if self.lookback_minutes:
             if changed:
@@ -299,6 +300,15 @@ class LiveScanner:
 
     # ------------------------------------------------------------------
     def _emit_bar(self, tf, ts, row, bar, df) -> bool:
+        # Stale-signal guard: a restart with an old state file, or a long feed
+        # outage, must never fire entries for bars that are long gone.
+        max_age = getattr(self.cfg, "max_alert_age_min", 10)
+        age_min = (pd.Timestamp.now(tz=self.tz) - pd.Timestamp(ts)).total_seconds() / 60.0
+        if max_age and age_min > max_age:
+            log.warning("[%s] skipping stale bar %s (%.0fm old > MAX_ALERT_AGE_MIN=%s)",
+                        tf, ts, age_min, max_age)
+            return False
+
         # Chart-anchor (actual swing bar) timestamps per speed tier — mirrors
         # where the Pine label is drawn (bar_index - pivLen / - fastPivLen);
         # TIER 1 instant trades anchor on the sweep bar itself.
@@ -349,10 +359,16 @@ class LiveScanner:
                 continue
             result = self.notifier.send(text)
             if result is False:
+                # Queue for redelivery instead of losing the signal; the key is
+                # only marked as sent once it has actually gone out.
+                self.state.add_pending(
+                    key, text,
+                    pd.Timestamp.now(tz=self.tz).isoformat())
+                changed = True
                 if self.lookback_minutes:
-                    log.warning("Alert delivery failed in lookback run, will try next run: %s", key)
+                    log.warning("Alert delivery failed in lookback run, queued for retry: %s", key)
                 else:
-                    log.warning("Alert delivery failed, will retry next cycle: %s", key)
+                    log.warning("Alert delivery failed, queued for retry: %s", key)
             else:
                 self.state.mark(key)
                 changed = True

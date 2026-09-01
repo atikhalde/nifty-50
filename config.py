@@ -154,6 +154,19 @@ class ScannerConfig:
 
     # --- alert options ---
     sweep_alerts: bool = field(default_factory=lambda: _env_bool("SWEEP_ALERTS", True))
+    # Never alert on bars older than this (guards against a restart with a
+    # stale state file or a long data outage replaying dead signals).
+    max_alert_age_min: int = field(
+        default_factory=lambda: _env_int("MAX_ALERT_AGE_MIN", 10, lo=1, hi=10**6))
+    # Undelivered alerts are retried for at most this long, then dropped.
+    pending_max_age_min: int = field(
+        default_factory=lambda: _env_int("PENDING_MAX_AGE_MIN", 30, lo=1, hi=1440))
+
+    # --- TradingView webhook receiver (--webhook) ---
+    webhook_host: str = field(default_factory=lambda: _env_str("WEBHOOK_HOST", "0.0.0.0"))
+    webhook_port: int = field(
+        default_factory=lambda: _env_int("WEBHOOK_PORT", 5000, lo=1, hi=65535))
+    webhook_secret: str = field(default_factory=lambda: _env_str("WEBHOOK_SECRET", ""))
 
     # --- state / logging ---
     state_file: str = field(

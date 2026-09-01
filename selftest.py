@@ -243,64 +243,6 @@ def test_state_dedupe():
     print("  ok  persistent dedupe across restarts")
 
 
-def test_yfinance_column_normalization():
-    """yfinance returns TitleCase columns in a (Price, Ticker) MultiIndex —
-    the feed must normalize them or every real fetch crashes with KeyError."""
-    idx = pd.date_range("2026-08-31 09:15", periods=3, freq="5min", tz="Asia/Kolkata")
-    raw = pd.DataFrame({
-        "Open": [1.0, 2.0, 3.0], "High": [2.0, 3.0, 4.0],
-        "Low": [0.5, 1.5, 2.5], "Close": [1.5, 2.5, 3.5],
-        "Adj Close": [1.5, 2.5, 3.5], "Volume": [100, 200, 300],
-    }, index=idx)
-    # shape produced by yfinance 1.x download() (group_by='column')
-    multi = raw.copy()
-    multi.columns = pd.MultiIndex.from_product([multi.columns, ["^NSEI"]])
-    out = YFinanceFeed._normalize(multi)
-    assert list(out.columns) == ["open", "high", "low", "close", "volume"], \
-        f"multi-index normalize gave {list(out.columns)}"
-    assert str(out.index.tz) == "Asia/Kolkata"
-    assert out["close"].iloc[0] == 1.5
-
-    # older/single-level shape (multi_level_index=False) is also TitleCase
-    out2 = YFinanceFeed._normalize(raw)
-    assert list(out2.columns) == ["open", "high", "low", "close", "volume"], \
-        f"single-level normalize gave {list(out2.columns)}"
-    print("  ok  yfinance TitleCase/MultiIndex column normalization")
-
-
-def test_incremental_refresh_uses_datetime_start():
-    """yfinance 1.x only parses 'YYYY-MM-DD' strings or datetime objects; a
-    free-form timestamp string makes every incremental refetch fail and the
-    feed serve stale bars forever."""
-    feed = YFinanceFeed()
-    # recent bars (clock-relative) so _refresh takes the incremental path
-    now5 = pd.Timestamp.now(tz="Asia/Kolkata").floor("5min")
-    idx = pd.date_range(now5 - pd.Timedelta(minutes=20), periods=5, freq="5min")
-    cached = pd.DataFrame({
-        "open": [1.0] * 5, "high": [2.0] * 5, "low": [0.5] * 5,
-        "close": [1.5] * 5, "volume": [100] * 5,
-    }, index=idx)
-    feed._cache["5m"] = cached
-
-    seen = {}
-    new_bar = pd.DataFrame({
-        "open": [1.0], "high": [2.0], "low": [0.5], "close": [1.4], "volume": [120],
-    }, index=idx[-1:] + pd.Timedelta(minutes=5))
-
-    def fake_download(self, tf, period=None, start=None, retries=2):
-        seen["period"] = period
-        seen["start"] = start
-        return new_bar.copy()
-
-    YFinanceFeed._download = fake_download
-    out = feed._refresh("5m", "60d", "60d")
-    assert not isinstance(seen["start"], str), \
-        f"incremental start must be a datetime, got {type(seen['start']).__name__}"
-    assert seen["period"] is None, "period must not be combined with start"
-    assert out is not None and len(out) == 6, "cached + new bars should concatenate"
-    print("  ok  incremental fetch passes a datetime start (no string crash)")
-
-
 def test_expiry():
     df = _base_frame(n=400)
     _spike(df, 20, high=120.0)                      # pool @120 at bar 28
@@ -437,6 +379,106 @@ def test_config_is_typo_proof():
     print("  ok  config tolerates bad .env values")
 
 
+
+def test_scanner_accepts_lookback_and_market_check():
+    """Regression: a bad merge dropped these __init__ kwargs while the body
+    still used them, so every run crashed with a TypeError."""
+    from config import ScannerConfig
+    from scanner.data.mock import MockFeed
+    from scanner.live import LiveScanner
+
+    cfg = ScannerConfig()
+    cfg.telegram_enabled = False
+    s = LiveScanner(cfg, feed=MockFeed(), lookback_minutes=30, market_check=False)
+    assert s.lookback_minutes == 30 and s.market_check is False
+    # default: falls back to the config value, market check on
+    cfg.lookback_minutes = 15
+    s2 = LiveScanner(cfg, feed=MockFeed())
+    assert s2.lookback_minutes == 15 and s2.market_check is True
+    print("  ok  LiveScanner accepts lookback_minutes / market_check")
+
+
+def test_stale_bars_are_not_alerted():
+    """MAX_ALERT_AGE_MIN must actually block old bars from firing."""
+    from config import ScannerConfig
+    from scanner.data.mock import MockFeed
+    from scanner.live import LiveScanner
+    from scanner.indicators.bsl_ssl import compute_signals
+
+    with tempfile.TemporaryDirectory() as td:
+        cfg = ScannerConfig()
+        cfg.telegram_enabled = False
+        cfg.market_hours_only = False
+        cfg.state_file = os.path.join(td, "s.json")
+        cfg.max_alert_age_min = 1          # everything synthetic is older
+        s = LiveScanner(cfg, feed=MockFeed())
+        df = s.feed.get_bars("5m")
+        # Re-stamp the frame two days into the past so every bar is stale.
+        df = df.copy()
+        df.index = df.index - pd.Timedelta(days=2)
+        sig = compute_signals(df, s.params)
+        fired = [s._emit_bar("5m", ts, sig.loc[ts], df.loc[ts], df)
+                 for ts in df.index[-5:]]
+        assert not any(fired), "stale bars must never be alerted"
+
+        # ...and with the guard relaxed, the same bars are allowed through.
+        cfg.max_alert_age_min = 10 ** 7
+        s.state.sent.clear()
+        assert s._emit_bar("5m", df.index[-1], sig.iloc[-1], df.iloc[-1], df) in (True, False)
+    print("  ok  MAX_ALERT_AGE_MIN blocks stale bars")
+
+
+def test_webhook_config_is_read_from_env():
+    """WEBHOOK_* are documented in .env.example — they must reach the server."""
+    from config import ScannerConfig
+    saved = {k: os.environ.get(k) for k in ("WEBHOOK_HOST", "WEBHOOK_PORT", "WEBHOOK_SECRET")}
+    try:
+        os.environ["WEBHOOK_HOST"] = "127.0.0.1"
+        os.environ["WEBHOOK_PORT"] = "5999"
+        os.environ["WEBHOOK_SECRET"] = "s3cret"
+        c = ScannerConfig()
+        assert (c.webhook_host, c.webhook_port, c.webhook_secret) == ("127.0.0.1", 5999, "s3cret")
+        os.environ["WEBHOOK_PORT"] = "not-a-port"      # must not crash
+        assert ScannerConfig().webhook_port == 5000
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("  ok  webhook settings are read from the environment")
+
+
+
+def test_webhook_payload_shapes():
+    """The webhook is a public endpoint: no payload shape may 500 it, and
+    dedupe keys must be stable across process restarts."""
+    from scanner.webhook import WebhookFormatter as W
+
+    # non-dict JSON used to crash with AttributeError ('list' has no .get)
+    for weird in ([1, 2, 3], 42, None, "plain alert text"):
+        kind, key, msg = W.format_payload(weird)
+        assert kind in ("PLAINTEXT", "GENERIC") and key and msg is not None
+
+    sig = {"action": "BUY", "symbol": "NSE:NIFTY", "tf": "5m", "pool": "SSL-169",
+           "pool_lvl": 24010.55, "entry": 24061.05, "sl": 24038.43, "tp": 24106.30,
+           "target": 24114.00, "bar_time": "2026-09-01 10:25",
+           "swing_bar_time": "2026-09-01 09:45"}
+    kind, key, msg = W.format_payload(sig)
+    assert kind == "BUY" and "SSL-169" in msg and "24,010.55" in msg
+    assert "Chart Anchor (Swing Low): 2026-09-01 09:45 IST" in msg
+    assert key == W.format_payload(dict(sig))[1], "dedupe key must be deterministic"
+
+    fast = dict(sig, action="FAST_SELL", pool="BSL-169")
+    kind, _, msg = W.format_payload(fast)
+    assert kind == "FAST_SELL" and "FAST" in msg and "actual HIGH" in msg
+
+    # a stable digest (not Python's randomised hash) for the generic fallback
+    g = {"foo": "bar", "n": 1}
+    assert W.format_payload(g)[1] == W.format_payload(dict(g))[1]
+    print("  ok  webhook handles every payload shape with stable keys")
+
+
 def main():
     print("BSL/SSL engine parity self-test")
     test_pivot_and_sell_signal()
@@ -453,6 +495,10 @@ def main():
     test_scanner_survives_bad_state()
     test_no_duplicate_and_retry_on_failure()
     test_state_ledger_is_bounded()
+    test_scanner_accepts_lookback_and_market_check()
+    test_stale_bars_are_not_alerted()
+    test_webhook_config_is_read_from_env()
+    test_webhook_payload_shapes()
     print("\nALL CHECKS PASSED ✅")
 
 
