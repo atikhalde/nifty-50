@@ -198,6 +198,25 @@ scanner/
 
 ---
 
+## 🔧 Troubleshooting
+
+- **Actions run is green but no Telegram alert arrives**: check the run log
+  for `timeframe 5m failed` / `yfinance fetch failed`. yfinance is unofficial
+  and can be throttled — the run skips to the next 5-minute slot by design.
+  Also confirm the four secrets (`BOT1_TOKEN`, `BOT2_TOKEN`, `CHAT_ID`,
+  `CHAT_ID_2`) are set; if they are missing, alerts are only logged and are
+  **not** marked as sent, so they will be delivered once the secrets are added.
+- **Local scanner downloads bars once and then never sends again**: make sure
+  the yfinance feed can refresh (check `logs/scanner.log` for fetch errors).
+  The feed normalizes any yfinance column layout (TitleCase / MultiIndex
+  `(Price, Ticker)`) and passes a datetime — not a string — to the incremental
+  fetch, which yfinance 1.x requires.
+- **Sanity-check the feed without Telegram**:
+  `TELEGRAM_ENABLED=false python run_scanner.py --once` — signals that occur
+  are printed as dry-run alerts.
+
+---
+
 ## ⚠️ Notes & disclaimer
 
 - **yfinance** is free and unofficial; Yahoo can throttle — if you see
