@@ -15,7 +15,11 @@ Validates:
   6. SL/TP math matches close -/+ atr*atr_sl*rr_target.
   7. SentState persists and never re-sends the same key.
   8. Webhook payload formatter correctly processes TradingView JSON and plaintext.
-  9. Dual timestamps (Chart Anchor vs Confirmation) match accurately.
+  9. Dual timestamps (Chart Anchor vs Execution Bar) match accurately.
+ 10. Multi-Speed TIER 2: fast_piv_len=3 fires 62% faster than piv_len=8.
+ 11. Multi-Speed TIER 3: standard piv_len=8 remains intact for macro tracking.
+ 12. Multi-Speed TIER 1: instant sweep trades fire on the sweep candle (0-bar
+     lag) with wick SL and 1:2 R:R TP.
 """
 
 from __future__ import annotations
@@ -295,6 +299,156 @@ def test_expiry():
     print("  ok  pool expiry frees the slot for a new pool")
 
 
+def test_fast_pivot_62pct_faster():
+    """TIER 2: fast_piv_len=3 confirms 5 bars earlier than piv_len=8 (62.5%)."""
+    df = _base_frame()
+    _spike(df, 20, high=120.0)
+    p = BSLSSLParams()
+    assert p.piv_len == 8 and p.fast_piv_len == 3
+    faster = (p.piv_len - p.fast_piv_len) / p.piv_len
+    assert abs(faster - 0.625) < 1e-9, f"expected 62.5% faster, got {faster:.1%}"
+
+    sig = compute_signals(df, p)
+    assert not bool(sig["fast_sell_sig"].iloc[20]), "fast signal must not fire on the swing bar"
+    assert bool(sig["fast_sell_sig"].iloc[23]), "FAST SELL must fire on bar 20+3=23"
+    assert not bool(sig["sell_sig"].iloc[23]), "STANDARD must still wait for 8-bar confirmation"
+    assert bool(sig["sell_sig"].iloc[28]), "STANDARD SELL still fires on bar 20+8=28"
+    assert sig["fast_new_bsl_lvl"].iloc[23] == 120.0
+    assert sig["fast_new_bsl_name"].iloc[23] == "FAST-BSL"
+    # 5m: 3 bars = 15 minutes; 1m: 3 bars = 3 minutes
+    assert (df.index[23] - df.index[20]) == pd.Timedelta(minutes=15)
+    print("  ok  TIER 2 fast pivot (3-bar, 62% faster) + TIER 3 standard intact")
+
+
+def test_fast_buy_and_magnet():
+    df = _base_frame()
+    _spike(df, 25, low=70.0)
+    sig = compute_signals(df, BSLSSLParams())
+    assert bool(sig["fast_buy_sig"].iloc[28]), "FAST BUY on bar 25+3=28"
+    assert bool(sig["buy_sig"].iloc[33]), "STANDARD BUY still on bar 25+8=33"
+
+    pm = BSLSSLParams(sig_dir="BSL→BUY · SSL→SELL")
+    sigm = compute_signals(df, pm)
+    assert bool(sigm["fast_sell_sig"].iloc[28]), "magnet: fast SSL start -> FAST SELL"
+    assert not bool(sigm["fast_buy_sig"].iloc[28])
+    print("  ok  TIER 2 fast BUY + magnet flip")
+
+
+def test_instant_sweep_trade_0_bar_lag():
+    """TIER 1: execute on the sweep candle close, wick SL, 1:2 R:R TP."""
+    df = _base_frame()
+    _spike(df, 20, high=120.0)                     # BSL @120 confirmed at 28
+    _spike(df, 25, low=70.0)                       # SSL @70 confirmed at 33
+    _spike(df, 40, high=135.0, close=95.0)         # BSL sweep
+    _spike(df, 45, low=50.0, close=95.0)           # SSL sweep
+    sig = compute_signals(df, BSLSSLParams())
+
+    assert bool(sig["swept_bsl"].iloc[40])
+    assert bool(sig["inst_sell_sig"].iloc[40]), "INSTANT SELL must fire ON the BSL sweep bar (0-lag)"
+    assert not bool(sig["inst_sell_sig"].iloc[39]), "must not fire before the sweep"
+    assert sig["inst_sl_short"].iloc[40] == 135.0, "tight wick SL = sweep candle high"
+    # entry 95, risk 40, 1:2 TP = 95 - 80 = 15
+    assert abs(sig["inst_tp_short"].iloc[40] - (95.0 - 2.0 * (135.0 - 95.0))) < 1e-9
+    assert sig["inst_pool_lvl"].iloc[40] == 120.0
+
+    assert bool(sig["swept_ssl"].iloc[45])
+    assert bool(sig["inst_buy_sig"].iloc[45]), "INSTANT BUY must fire ON the SSL sweep bar (0-lag)"
+    assert sig["inst_sl_long"].iloc[45] == 50.0, "tight wick SL = sweep candle low"
+    assert abs(sig["inst_tp_long"].iloc[45] - (95.0 + 2.0 * (95.0 - 50.0))) < 1e-9
+    assert sig["inst_pool_lvl"].iloc[45] == 70.0
+    print("  ok  TIER 1 instant sweep trade (0-bar lag, wick SL, 1:2 R:R)")
+
+
+def test_multi_speed_telegram_timestamps():
+    """All 3 tiers expose Chart Anchor vs Execution Bar."""
+    df = _base_frame()
+    _spike(df, 20, high=120.0)
+    _spike(df, 40, high=135.0, close=95.0)
+    p = BSLSSLParams()
+    sig = compute_signals(df, p)
+
+    with tempfile.TemporaryDirectory() as td:
+        sc = _scanner_for(p, os.path.join(td, "state.json"))
+
+        msg_std = sc._build_signal_msg(
+            "SELL", "5m", df.index[28], sig.iloc[28], df.iloc[28], df.index[20], speed="standard")
+        assert "· STANDARD" in msg_std
+        assert "Chart Anchor (Swing High): 2026-08-01 10:55 IST" in msg_std
+        assert "Execution Bar: 2026-08-01 11:35 IST" in msg_std
+        assert "Swing confirmed 8 bars after actual HIGH" in msg_std
+
+        msg_fast = sc._build_signal_msg(
+            "SELL", "5m", df.index[23], sig.iloc[23], df.iloc[23], df.index[20], speed="fast")
+        assert "· FAST" in msg_fast
+        assert "FAST-BSL" in msg_fast
+        assert "Chart Anchor (Swing High): 2026-08-01 10:55 IST" in msg_fast
+        assert "Execution Bar: 2026-08-01 11:10 IST" in msg_fast  # 3 x 5m after 10:55
+        assert "Fast swing confirmed 3 bars after actual HIGH" in msg_fast
+        assert "62% faster" in msg_fast
+
+        msg_inst = sc._build_instant_msg(
+            "SELL", "5m", df.index[40], sig.iloc[40], df.iloc[40], df.index[40])
+        assert "INSTANT SWEEP SELL" in msg_inst
+        assert "TIER 1" in msg_inst
+        assert "(wick)" in msg_inst
+        assert "0-bar lag" in msg_inst
+        # Chart Anchor and Execution Bar are the same candle
+        assert "Chart Anchor (Sweep High): 2026-08-01 12:35 IST" in msg_inst
+        assert "Execution Bar: 2026-08-01 12:35 IST" in msg_inst
+        assert "SL: 135.00" in msg_inst or "SL: 135.00" in msg_inst.replace(",", "")
+    print("  ok  dual timestamps (Chart Anchor vs Execution Bar) for all 3 tiers")
+
+
+def test_webhook_multi_speed_tiers():
+    """Webhook formatter emits distinct copy + dual timestamps per speed tier."""
+    std = {
+        "action": "BUY", "speed": "standard", "piv_len": 8,
+        "symbol": "NSE:NIFTY", "tf": "5m", "pool": "SSL-01",
+        "pool_lvl": 24010.55, "entry": 24061.05, "sl": 24038.43, "tp": 24106.30,
+        "target": 24114.00, "swing_bar_time": "2026-09-01 09:45",
+        "bar_time": "2026-09-01 10:25",
+    }
+    kind, key, msg = WebhookFormatter.format_payload(std)
+    assert kind == "BUY"
+    assert "STANDARD" in msg
+    assert "Chart Anchor (Swing Low): 2026-09-01 09:45 IST" in msg
+    assert "Execution Bar: 2026-09-01 10:25 IST" in msg
+    assert "Swing confirmed 8 bars after actual LOW" in msg
+
+    fast = {
+        "action": "BUY", "speed": "fast", "piv_len": 3,
+        "symbol": "NSE:NIFTY", "tf": "5m", "pool": "FAST-SSL",
+        "pool_lvl": 24010.55, "entry": 24040.00, "sl": 24020.00, "tp": 24080.00,
+        "target": 24114.00, "swing_bar_time": "2026-09-01 10:10",
+        "bar_time": "2026-09-01 10:25",
+    }
+    kind2, key2, msg2 = WebhookFormatter.format_payload(fast)
+    assert kind2 == "FAST_BUY"
+    assert "FAST" in msg2
+    assert "FAST-SSL" in msg2
+    assert "Chart Anchor (Swing Low): 2026-09-01 10:10 IST" in msg2
+    assert "Execution Bar: 2026-09-01 10:25 IST" in msg2
+    assert "Fast swing confirmed 3 bars after actual LOW" in msg2
+    assert "62% faster" in msg2
+    assert key2 != key
+
+    inst = {
+        "action": "INST_BUY", "speed": "instant", "piv_len": 0,
+        "symbol": "NSE:NIFTY", "tf": "5m", "pool": "SSL-01",
+        "pool_lvl": 24020.50, "entry": 24025.10, "sl": 24000.00, "tp": 24075.30,
+        "swing_bar_time": "2026-09-01 09:45", "bar_time": "2026-09-01 09:45",
+    }
+    kind3, key3, msg3 = WebhookFormatter.format_payload(inst)
+    assert kind3 == "INST_BUY"
+    assert "INSTANT SWEEP BUY" in msg3
+    assert "TIER 1" in msg3
+    assert "(wick)" in msg3
+    assert "0-bar lag" in msg3
+    assert "Chart Anchor (Sweep Low): 2026-09-01 09:45 IST" in msg3
+    assert "Execution Bar: 2026-09-01 09:45 IST" in msg3
+    print("  ok  webhook formatter distinct alerts for Standard / Fast / Instant")
+
+
 def test_webhook_payload_formatter():
     # 1. User sample BUY alert
     buy_json = {
@@ -369,6 +523,11 @@ def main():
     test_yfinance_column_normalization()
     test_incremental_refresh_uses_datetime_start()
     test_webhook_payload_formatter()
+    test_fast_pivot_62pct_faster()
+    test_fast_buy_and_magnet()
+    test_instant_sweep_trade_0_bar_lag()
+    test_multi_speed_telegram_timestamps()
+    test_webhook_multi_speed_tiers()
     print("\nALL CHECKS PASSED ✅")
 
 

@@ -89,26 +89,42 @@ def main() -> int:
         from scanner.indicators.bsl_ssl import compute_signals
         df = make_mock_bars()
         sig = compute_signals(df, params)
-        rows = sig[(sig["buy_sig"]) | (sig["sell_sig"]) | (sig["swept_ssl"]) | (sig["swept_bsl"])]
+        mask = (
+            sig["buy_sig"] | sig["sell_sig"]
+            | sig["fast_buy_sig"] | sig["fast_sell_sig"]
+            | sig["inst_buy_sig"] | sig["inst_sell_sig"]
+            | sig["swept_ssl"] | sig["swept_bsl"]
+        )
+        rows = sig[mask]
         if rows.empty:
             print("No signals found in synthetic data (should not happen).")
             return 1
         print("=" * 60)
         print("SAMPLE TELEGRAM MESSAGES (offline, from synthetic data)")
+        print("Multi-Speed: STANDARD / FAST / INSTANT")
         print("=" * 60)
-        for ts, row in list(rows.iterrows())[-6:]:
+        for ts, row in list(rows.iterrows())[-10:]:
             bar = df.loc[ts]
-            # actual swing = confirmation - piv_len (for sample, compute from index)
             try:
                 pos = df.index.get_loc(ts)
                 actual_ts = df.index[pos - params.piv_len] if pos >= params.piv_len else None
+                fast_ts = df.index[pos - params.fast_piv_len] if pos >= params.fast_piv_len else None
             except Exception:
                 actual_ts = None
+                fast_ts = None
             msgs = []
             if bool(row["buy_sig"]):
-                msgs.append(scanner._build_signal_msg("BUY", "5m", ts, row, bar, actual_ts))
+                msgs.append(scanner._build_signal_msg("BUY", "5m", ts, row, bar, actual_ts, speed="standard"))
             if bool(row["sell_sig"]):
-                msgs.append(scanner._build_signal_msg("SELL", "5m", ts, row, bar, actual_ts))
+                msgs.append(scanner._build_signal_msg("SELL", "5m", ts, row, bar, actual_ts, speed="standard"))
+            if bool(row["fast_buy_sig"]):
+                msgs.append(scanner._build_signal_msg("BUY", "5m", ts, row, bar, fast_ts, speed="fast"))
+            if bool(row["fast_sell_sig"]):
+                msgs.append(scanner._build_signal_msg("SELL", "5m", ts, row, bar, fast_ts, speed="fast"))
+            if bool(row["inst_buy_sig"]):
+                msgs.append(scanner._build_instant_msg("BUY", "5m", ts, row, bar, ts))
+            if bool(row["inst_sell_sig"]):
+                msgs.append(scanner._build_instant_msg("SELL", "5m", ts, row, bar, ts))
             if bool(row["swept_ssl"]):
                 msgs.append(scanner._build_sweep_msg("SSL", "5m", ts, row, bar))
             if bool(row["swept_bsl"]):
