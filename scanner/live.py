@@ -87,6 +87,10 @@ class LiveScanner:
         # across fresh machines), NOT from last_evaluated.
         self.lookback_minutes = int(lookback_minutes or 0)
         self.market_check = market_check
+        # Consecutive per-timeframe cycle failures — escalates to CRITICAL so a
+        # scanner that has stopped producing alerts is LOUD in the logs instead
+        # of looking healthy (the old behaviour: exceptions swallowed quietly).
+        self._tf_failures: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # main loop
@@ -125,8 +129,15 @@ class LiveScanner:
                     continue
                 sig = compute_signals(df, self.params)
                 self._process_new_closed_bars(tf, df, sig, now)
+                self._tf_failures[tf] = 0
             except Exception:
+                fails = self._tf_failures.get(tf, 0) + 1
+                self._tf_failures[tf] = fails
                 log.exception("timeframe %s failed", tf)
+                if fails >= 5:
+                    log.critical("timeframe %s has failed %d scan cycles IN A ROW — "
+                                 "no alerts are being produced for it; investigate NOW",
+                                 tf, fails)
 
     # ------------------------------------------------------------------
     def _market_open(self) -> bool:
@@ -172,6 +183,8 @@ class LiveScanner:
             bar = df.loc[ts]
             changed |= self._emit_bar(tf, ts, row, bar, df)
 
+    # ------------------------------------------------------------------
+
         if self.lookback_minutes:
             if changed:
                 self.state.persist()
@@ -188,12 +201,42 @@ class LiveScanner:
                          tf, len(new_bars), new_bars[-1])
 
     # ------------------------------------------------------------------
-    def _emit_bar(self, tf, ts, row, bar, actual_ts, df) -> bool:
+    def _emit_bar(self, tf, ts, row, bar, df) -> bool:
+        # Chart-anchor (actual swing bar) timestamps per speed tier — mirrors
+        # where the Pine label is drawn (bar_index - pivLen / - fastPivLen);
+        # TIER 1 instant trades anchor on the sweep bar itself.
+        pos = df.index.get_loc(ts)
+        anchor_std = (df.index[pos - self.params.piv_len]
+                      if pos >= self.params.piv_len else None)
+        anchor_fast = (df.index[pos - self.params.fast_piv_len]
+                       if self.params.fast_piv_len > 0 and pos >= self.params.fast_piv_len
+                       else None)
+
         alerts = []
-        if self.params.show_signals and bool(row["buy_sig"]):
-            alerts.append(("BUY", self._build_signal_msg("BUY", tf, ts, row, bar, actual_ts)))
-        if self.params.show_signals and bool(row["sell_sig"]):
-            alerts.append(("SELL", self._build_signal_msg("SELL", tf, ts, row, bar, actual_ts)))
+        if self.params.show_signals:
+            # TIER 3 STANDARD (piv_len confirmation)
+            if bool(row["buy_sig"]):
+                alerts.append(("BUY", self._build_signal_msg(
+                    "BUY", tf, ts, row, bar, anchor_std, speed="standard")))
+            if bool(row["sell_sig"]):
+                alerts.append(("SELL", self._build_signal_msg(
+                    "SELL", tf, ts, row, bar, anchor_std, speed="standard")))
+            # TIER 2 FAST (fast_piv_len confirmation; engine flags already
+            # include the params.fast_signals master switch)
+            if bool(row["fast_buy_sig"]):
+                alerts.append(("FAST_BUY", self._build_signal_msg(
+                    "BUY", tf, ts, row, bar, anchor_fast, speed="fast")))
+            if bool(row["fast_sell_sig"]):
+                alerts.append(("FAST_SELL", self._build_signal_msg(
+                    "SELL", tf, ts, row, bar, anchor_fast, speed="fast")))
+        # TIER 1 INSTANT sweep trades (engine flags already include the
+        # params.instant_sweep_trades master switch)
+        if bool(row["inst_buy_sig"]):
+            alerts.append(("INST_BUY", self._build_instant_msg(
+                "BUY", tf, ts, row, bar, ts)))
+        if bool(row["inst_sell_sig"]):
+            alerts.append(("INST_SELL", self._build_instant_msg(
+                "SELL", tf, ts, row, bar, ts)))
         if self.cfg.sweep_alerts:
             if bool(row["swept_ssl"]):
                 alerts.append(("SWEEP_SSL", self._build_sweep_msg("SSL", tf, ts, row, bar)))
@@ -263,7 +306,6 @@ class LiveScanner:
             if is_fast:
                 if magnet:
                     pool_name, pool_lvl = row["fast_new_bsl_name"], row["fast_new_bsl_lvl"]
-                    target = row["new_bsl_lvl"] if row.get("new_bsl_lvl") == row.get("new_bsl_lvl") else row["fast_new_bsl_lvl"]
                     # Prefer the intact standard-book target when present
                     target = row["next_bsl"] if not (isinstance(row["next_bsl"], float) and math.isnan(row["next_bsl"])) else row["fast_new_bsl_lvl"]
                     swing_word = "HIGH"

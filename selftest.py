@@ -20,6 +20,8 @@ Validates:
  11. Multi-Speed TIER 3: standard piv_len=8 remains intact for macro tracking.
  12. Multi-Speed TIER 1: instant sweep trades fire on the sweep candle (0-bar
      lag) with wick SL and 1:2 R:R TP.
+ 13. LiveScanner wiring: new closed bars produce (and dedupe) real alerts for
+     all tiers — guards against a silent-death regression in the alert path.
 """
 
 from __future__ import annotations
@@ -510,6 +512,56 @@ def test_webhook_payload_formatter():
     print("  ok  webhook formatter handles TradingView JSON & math accurately")
 
 
+def test_live_scanner_wiring_offline():
+    """End-to-end alert-path wiring through LiveScanner (offline, MockFeed).
+
+    Regression guard: production previously called _emit_bar with a wrong
+    signature; tick() swallowed the TypeError every cycle, so the scanner
+    LOOKED alive but never sent a single alert. This test calls the exact
+    method tick() calls and requires >0 emitted+deduped alerts.
+    """
+    from config import ScannerConfig
+    from scanner.data.mock import MockFeed
+    from scanner.live import LiveScanner
+
+    with tempfile.TemporaryDirectory() as td:
+        cfg = ScannerConfig()
+        cfg.market_hours_only = False
+        cfg.telegram_enabled = False          # dry-run: logged + marked sent
+        cfg.state_file = os.path.join(td, "state.json")
+        cfg.log_file = os.path.join(td, "scanner.log")
+
+        sc = LiveScanner(cfg, feed=MockFeed())
+        df = sc.feed.get_bars("5m")
+
+        # pretend bars up to index 99 were evaluated in an earlier session
+        sc.state.set_last_evaluated("5m", df.index[99].isoformat())
+        sig = compute_signals(df, sc.params)
+        now = df.index[-1] + pd.Timedelta(minutes=5)   # every bar is closed
+
+        # The exact method tick() invokes — must not raise.
+        sc._process_new_closed_bars("5m", df, sig, now)
+        assert len(sc.state.sent) > 0, "live path emitted ZERO alerts — wiring broken"
+
+        kinds = {k.split("|")[2] for k in sc.state.sent}
+        later = sig.iloc[100:]
+        assert kinds & {"BUY", "SELL", "SWEEP_SSL", "SWEEP_BSL"}, \
+            f"no standard/sweep alerts emitted (kinds={kinds})"
+        if bool(later["fast_buy_sig"].any()) or bool(later["fast_sell_sig"].any()):
+            assert kinds & {"FAST_BUY", "FAST_SELL"}, "TIER 2 engine fired but no FAST alert"
+        if bool(later["inst_buy_sig"].any()) or bool(later["inst_sell_sig"].any()):
+            assert kinds & {"INST_BUY", "INST_SELL"}, "TIER 1 engine fired but no INST alert"
+
+        # Re-walking already-evaluated bars must never duplicate an alert.
+        n_before = len(sc.state.sent)
+        sc._process_new_closed_bars("5m", df, sig, now)
+        assert len(sc.state.sent) == n_before, "duplicate alerts on re-walk"
+
+        # Public entry point must complete cleanly as well.
+        sc.tick()
+    print("  ok  live wiring: standard/FAST/INST alerts emitted + strictly deduped")
+
+
 def main():
     print("BSL/SSL engine parity self-test")
     test_pivot_and_sell_signal()
@@ -528,6 +580,7 @@ def main():
     test_instant_sweep_trade_0_bar_lag()
     test_multi_speed_telegram_timestamps()
     test_webhook_multi_speed_tiers()
+    test_live_scanner_wiring_offline()
     print("\nALL CHECKS PASSED ✅")
 
 
