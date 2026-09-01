@@ -172,6 +172,131 @@ def test_expiry():
     print("  ok  pool expiry frees the slot for a new pool")
 
 
+def test_feed_normalisation():
+    """The live feed must survive every shape yfinance actually returns."""
+    from scanner.data.yfinance_feed import YFinanceFeed, FeedError
+
+    f = YFinanceFeed()
+    idx = pd.date_range("2026-09-01 03:45", periods=6, freq="5min")  # naive UTC
+    base = dict(Open=[100.0] * 6, High=[106.0] * 6, Low=[99.0] * 6,
+                Close=[104.0] * 6, Volume=[10.0] * 6)
+
+    # MultiIndex columns (yfinance >= 0.2.51) must flatten, index -> IST.
+    mi = pd.DataFrame(base, index=idx)
+    mi.columns = pd.MultiIndex.from_product([mi.columns, ["^NSEI"]])
+    d = f._normalise(mi)
+    assert list(d.columns) == ["open", "high", "low", "close", "volume"]
+    assert str(d.index.tz) == "Asia/Kolkata", "naive Yahoo index must be UTC->IST"
+
+    # Corrupt bars (NaN close, zero print, high<low) must be dropped.
+    b = pd.DataFrame(base, index=idx)
+    b.iloc[1, b.columns.get_loc("Close")] = np.nan
+    b.iloc[2, b.columns.get_loc("Open")] = 0.0
+    b.iloc[3, b.columns.get_loc("High")] = 1.0
+    assert len(f._normalise(b)) == 3, "bad ticks must be filtered out"
+
+    # Duplicate / unsorted timestamps must be de-duplicated and ordered.
+    c = pd.concat([pd.DataFrame(base, index=idx)] * 2).sort_index(ascending=False)
+    d = f._normalise(c)
+    assert d.index.is_unique and d.index.is_monotonic_increasing
+
+    # Missing OHLC must raise a typed error (caught & retried by the feed).
+    try:
+        f._normalise(pd.DataFrame({"Open": [1.0]}, index=idx[:1]))
+        raise AssertionError("missing columns should raise")
+    except FeedError:
+        pass
+    print("  ok  feed normalisation (MultiIndex, tz, bad ticks, dupes)")
+
+
+def test_scanner_survives_bad_state():
+    """A tz-naive or corrupt last_evaluated must not kill a live scan cycle."""
+    import json
+    from config import ScannerConfig
+    from scanner.data.mock import MockFeed
+    from scanner.live import LiveScanner
+
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        with open(sf, "w", encoding="utf-8") as fh:
+            json.dump({"sent": {},
+                       "last_evaluated": {"5m": "2026-09-01T10:00:00",   # tz-naive
+                                          "1m": "not-a-date"}}, fh)      # garbage
+        cfg = ScannerConfig()
+        cfg.market_hours_only = False
+        cfg.telegram_enabled = False
+        cfg.state_file = sf
+        LiveScanner(cfg, feed=MockFeed()).tick()   # must not raise
+    print("  ok  scanner survives tz-naive / corrupt state")
+
+
+def test_no_duplicate_and_retry_on_failure():
+    """Failed delivery is retried; delivered alerts are never repeated."""
+    from config import ScannerConfig
+    from scanner.data.mock import MockFeed
+    from scanner.live import LiveScanner
+    from scanner.indicators.bsl_ssl import compute_signals
+    from datetime import datetime
+
+    with tempfile.TemporaryDirectory() as td:
+        cfg = ScannerConfig()
+        cfg.market_hours_only = False
+        cfg.timeframes = ["5m"]
+        cfg.state_file = os.path.join(td, "s.json")
+        s = LiveScanner(cfg, feed=MockFeed())
+        s.notifier.bots = [("bot1", "tok", "chat")]
+
+        sent = []
+        s.notifier.send = lambda text: (sent.append(text), False)[1]   # always fails
+        s.tick()
+        assert not s.state.sent, "failed sends must NOT be marked (they retry)"
+
+        s.notifier.send = lambda text: (sent.append(text), True)[1]    # now succeeds
+        df = s.feed.get_bars("5m")
+        sig = compute_signals(df, s.params)
+        now = datetime.now(s.tz)
+        s.state.last_evaluated["5m"] = df.index[-6].isoformat()
+        s._process_new_closed_bars("5m", df, sig, now)
+        first = len(sent)
+        s.state.last_evaluated["5m"] = df.index[-6].isoformat()        # replay same bars
+        s._process_new_closed_bars("5m", df, sig, now)
+        assert len(sent) == first, "an already-delivered alert was sent twice!"
+    print("  ok  retry-on-failure + never a duplicate alert")
+
+
+def test_state_ledger_is_bounded():
+    with tempfile.TemporaryDirectory() as td:
+        st = SentState(os.path.join(td, "p.json"))
+        for i in range(SentState.MAX_KEYS + 3000):
+            st.mark(f"k{i}")
+        assert len(st.sent) <= SentState.MAX_KEYS
+        assert st.already_sent(f"k{SentState.MAX_KEYS + 2999}"), "newest key must survive"
+    print("  ok  dedupe ledger stays bounded")
+
+
+def test_config_is_typo_proof():
+    """A typo in .env must degrade to defaults, never crash at the open."""
+    from config import ScannerConfig
+
+    saved = {k: os.environ.get(k) for k in
+             ("SCAN_INTERVAL_SEC", "SESSION_START", "TIMEFRAMES", "LOG_LEVEL")}
+    try:
+        os.environ.update({"SCAN_INTERVAL_SEC": "abc", "SESSION_START": "9:15",
+                           "TIMEFRAMES": "1m,7m,5m", "LOG_LEVEL": "chatty"})
+        c = ScannerConfig()
+        assert c.scan_interval_sec == 20, "bad int must fall back to the default"
+        assert c.session_start == "09:15", "'9:15' must be normalised to '09:15'"
+        assert c.timeframes == ["1m", "5m"], "unsupported timeframe must be dropped"
+        assert c.log_level == "INFO"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("  ok  config tolerates bad .env values")
+
+
 def main():
     print("BSL/SSL engine parity self-test")
     test_pivot_and_sell_signal()
@@ -181,6 +306,12 @@ def main():
     test_magnet_mapping()
     test_expiry()
     test_state_dedupe()
+    print("\nLive-market hardening checks")
+    test_config_is_typo_proof()
+    test_feed_normalisation()
+    test_scanner_survives_bad_state()
+    test_no_duplicate_and_retry_on_failure()
+    test_state_ledger_is_bounded()
     print("\nALL CHECKS PASSED ✅")
 
 

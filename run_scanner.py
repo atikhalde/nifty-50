@@ -94,10 +94,16 @@ def main() -> int:
                 print(m)
         return 0
 
+    log = logging.getLogger("scanner")
+    for problem in cfg.validate():
+        log.warning("config: %s", problem)
+
     if not scanner.notifier.bots and cfg.telegram_enabled:
-        log = logging.getLogger("scanner")
         log.warning("No Telegram credentials found — set BOT1_TOKEN/BOT2_TOKEN and CHAT_ID in .env "
                     "(see .env.example). Alerts will only be logged until then.")
+    elif scanner.notifier.bots and not args.mock:
+        # Fail loudly BEFORE the open rather than at the first live signal.
+        scanner.notifier.check_credentials()
 
     if args.once:
         scanner.tick()
