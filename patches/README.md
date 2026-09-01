@@ -30,13 +30,13 @@ permission (GitHub refuses any push from an app that adds or edits files under
 
 ## How to apply
 
-From the repository root, on branch `arena/01a05b54-nifty-50`:
+From the repository root, on branch `arena/01a05e27-nifty-50`:
 
 ```bash
 git apply patches/0001-fix-actions-market-hours-gate-and-dedupe-cache.patch
 git add .github/workflows/scanner.yml
 git commit -m "Fix Actions market-hours gate and dedupe cache key"
-git push origin arena/01a05b54-nifty-50
+git push origin arena/01a05e27-nifty-50
 ```
 
 A normal user push (or a token with the `workflow` scope) is accepted.

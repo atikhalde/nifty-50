@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -16,6 +17,9 @@ from scanner.alerts.telegram import TelegramNotifier
 from scanner.state import SentState
 
 log = logging.getLogger("webhook")
+
+# Maximum accepted webhook body size (TradingView alert payloads are tiny).
+MAX_BODY_BYTES = 64 * 1024
 
 
 def _fmt_inr(v: float | None) -> str:
@@ -239,14 +243,20 @@ class WebhookFormatter:
             lines += [_bar_line(bar_time), _plain_bar(bar_time)]
             return "SWEEP_BSL", key, "\n".join(lines)
 
-        # Generic passthrough fallback
-        key = f"{sym}|{tf}|GENERIC|{bar_time}|{hash(str(payload))}"
+        # Generic passthrough fallback. NOTE: Python's built-in hash() is
+        # randomised per process, which would break dedupe across restarts —
+        # use a stable digest instead.
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:16]
+        key = f"{sym}|{tf}|GENERIC|{bar_time}|{digest}"
         return "GENERIC", key, f"🔔 TradingView Alert — {sym}\n{json.dumps(payload, indent=2)}"
 
     @staticmethod
     def _format_plaintext(text: str, default_sym: str = "NSE:NIFTY") -> tuple[str, str, str]:
         clean = text.strip()
-        key = f"{default_sym}|PLAINTEXT|{hash(clean)}"
+        digest = hashlib.sha256(clean.encode("utf-8")).hexdigest()[:16]
+        key = f"{default_sym}|PLAINTEXT|{digest}"
         return "PLAINTEXT", key, clean
 
 
@@ -279,8 +289,19 @@ def make_webhook_handler(notifier: TelegramNotifier, state: SentState, secret: s
                 self.end_headers()
 
         def do_POST(self):
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length).decode("utf-8")
+            # Reject oversized bodies before reading (an unauthenticated
+            # endpoint must not allow memory exhaustion).
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                content_length = 0
+            if content_length <= 0 or content_length > MAX_BODY_BYTES:
+                self.send_response(413)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error": "invalid or too large body"}')
+                return
+            body = self.rfile.read(content_length).decode("utf-8", errors="replace")
 
             # Secret auth check if configured
             if secret:
@@ -346,6 +367,14 @@ class WebhookServer:
         self.httpd = ThreadedHTTPServer((self.host, self.port), handler_cls)
 
     def run_forever(self):
+        if not self.secret:
+            log.warning(
+                "⚠️  WEBHOOK_SECRET is NOT set — the endpoint at %s:%s is UNAUTHENTICATED. "
+                "Anyone who reaches it can inject arbitrary/fake signals into your Telegram. "
+                "Set WEBHOOK_SECRET in .env and use http://<host>:%s/webhook?secret=<value> "
+                "in TradingView (or send the X-Webhook-Secret header).",
+                self.host, self.port, self.port,
+            )
         log.info("TradingView Webhook Server listening on http://%s:%d/webhook (Zero Delay)", self.host, self.port)
         log.info("Direct dual Telegram alerts active: %s bots ready", len(self.notifier.bots))
         try:
