@@ -468,13 +468,13 @@ if sellSig
     alert(msg, alert.freq_once_per_bar_close)
 
 if sweptSSL
-    msg = alertFmt == "JSON (Webhook)" ?
+    msg = alertFmt == "JSON (Webhook)" ? 
        ('{"action":"SWEEP_SSL","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","pool_lvl":' + str.tostring(sweptSSLlvl) + ',"close":' + str.tostring(close) + ',"bar_time":"' + f_timeStr(time) + '"}') :
        ("🧹 SSL SWEPT (Bullish Reclaim) — " + syminfo.ticker + " (" + timeframe.period + ")\n📈 Sell-side liquidity pool @ " + str.tostring(sweptSSLlvl, format.mintick) + " was swept — bullish (price reclaimed)\nClose " + str.tostring(close, format.mintick) + " > level " + str.tostring(sweptSSLlvl, format.mintick) + "\n📍 Chart Marker: ▲ Green Triangle below bar\nBar: " + f_timeStr(time) + " IST")
     alert(msg, alert.freq_once_per_bar_close)
 
 if sweptBSL
-    msg = alertFmt == "JSON (Webhook)" ?
+    msg = alertFmt == "JSON (Webhook)" ? 
        ('{"action":"SWEEP_BSL","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","pool_lvl":' + str.tostring(sweptBSLlvl) + ',"close":' + str.tostring(close) + ',"bar_time":"' + f_timeStr(time) + '"}') :
        ("🧹 BSL SWEPT (Bearish Rejection) — " + syminfo.ticker + " (" + timeframe.period + ")\n📉 Buy-side liquidity pool @ " + str.tostring(sweptBSLlvl, format.mintick) + " was swept — bearish (price failed above)\nClose " + str.tostring(close, format.mintick) + " < level " + str.tostring(sweptBSLlvl, format.mintick) + "\n📍 Chart Marker: ▼ Red Triangle above bar\nBar: " + f_timeStr(time) + " IST")
     alert(msg, alert.freq_once_per_bar_close)

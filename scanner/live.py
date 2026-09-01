@@ -181,8 +181,8 @@ class LiveScanner:
                 log.info("[%s] lookback: %d closed bar(s) in the last %dm window, alerts fired",
                          tf, len(new_bars), self.lookback_minutes)
             else:
-                log.info("[%s] lookback: %d closed bar(s) in window, nothing "
-                         "new to send", tf, len(new_bars))
+                log.info("[%s] lookback: %d closed bar(s) in window, nothing new to send",
+                         tf, len(new_bars))
         else:
             self.state.set_last_evaluated(tf, new_bars[-1].isoformat())
             self.state.persist()
@@ -207,18 +207,13 @@ class LiveScanner:
         for kind, text in alerts:
             lvl = self._level_of(kind, row)
             # Unique key = symbol|tf|kind|bar-time|level -> exactly once forever
-            key = f"{self.cfg.display_symbol}|{tf}|{kind}|{ts.isoformat()}|{round(lvl, 4) if lvl == lvl else 'na'}"
+            key = f"{self.cfg.display_symbol}|{tf}|{kind}|{ts.isoformat()}|{round(lvl, 4) if lvl == lvl and not math.isnan(lvl) else 'na'}"
             if self.state.already_sent(key):
                 continue
             result = self.notifier.send(text)
             if result is False:
                 if self.lookback_minutes:
                     log.warning("Alert delivery failed in lookback run, will try next run: %s", key)
-                    # one-shot run: log and move on — the same bar will be
-                    # inside the next run's window, but the key was NOT marked,
-                    # so it gets exactly one more chance next run
-                    log.warning("Alert delivery failed in lookback run, will try "
-                                "next run: %s", key)
                 else:
                     log.warning("Alert delivery failed, will retry next cycle: %s", key)
             else:
@@ -268,7 +263,6 @@ class LiveScanner:
         """
         sym = self.cfg.display_symbol
         entry = float(bar["close"])
-        atr = float(row["atr"]) if row["atr"] == row["atr"] else 0.0
 
         # Pool mapping mirrors the Pine script:
         #   default (fade):  buyPool = new SSL, sellPool = new BSL
@@ -281,12 +275,12 @@ class LiveScanner:
                 pool_name, pool_lvl = row["new_bsl_name"], row["new_bsl_lvl"]
                 target = row["new_bsl_lvl"]  # Pine: buyTgt = newBSLlvl in magnet mode
                 swing_word = "HIGH"
-                actual_side = "HIGH"
+                actual_side = "High"
             else:
                 pool_name, pool_lvl = row["new_ssl_name"], row["new_ssl_lvl"]
                 target = row["next_bsl"]      # Pine: buyTgt = nextBSL in fade mode
                 swing_word = "LOW"
-                actual_side = "LOW"
+                actual_side = "Low"
             sl, tp = row["sl_long"], row["tp_long"]
             head = f"🟢 BUY SIGNAL — {sym} ({tf})"
         else:  # SELL
@@ -294,23 +288,18 @@ class LiveScanner:
                 pool_name, pool_lvl = row["new_ssl_name"], row["new_ssl_lvl"]
                 target = row["new_ssl_lvl"]  # Pine: sellTgt = newSSLlvl in magnet
                 swing_word = "LOW"
-                actual_side = "LOW"
+                actual_side = "Low"
             else:
                 pool_name, pool_lvl = row["new_bsl_name"], row["new_bsl_lvl"]
                 target = row["next_ssl"]      # Pine: sellTgt = nextSSL in fade
                 swing_word = "HIGH"
-                actual_side = "HIGH"
+                actual_side = "High"
             sl, tp = row["sl_short"], row["tp_short"]
             head = f"🔴 SELL SIGNAL — {sym} ({tf})"
-            anchor_txt = f"📍 Chart Anchor (Swing HIGH): {swing_ts_str} IST"
-            swing_txt = f"⚡ Swing confirmed {piv_len} bars after actual HIGH (non-repainting)"
-
-        swing_txt = (f"Swing confirmed {self.params.piv_len} bars after the "
-                     f"actual {swing_word} (non-repainting)")
 
         # Format times
         conf_time_str = ts.strftime('%Y-%m-%d %H:%M')
-        actual_time_str = actual_ts.strftime('%Y-%m-%d %H:%M') if actual_ts is not None else "—"
+        actual_time_str = actual_ts.strftime('%Y-%m-%d %H:%M') if actual_ts is not None else None
 
         # Build message - matches Pine's alert + label + extra traceability
         lines = [
@@ -321,33 +310,18 @@ class LiveScanner:
         ]
         # Nearest pool - only show if valid (matches Pine's na check)
         if target is not None and target == target and not math.isnan(target):
-            # For default mode, this is opposite side pool; for magnet, it's the pool itself (same as pool_lvl)
-            # To avoid confusion when magnet shows same level twice, we label it clearly
             if magnet:
-                # In magnet mode Pine's buyTgt/sellTgt IS the pool itself, so we show as target
                 lines.append(f"🎯 Target pool: {_fmt_inr(target)}")
             else:
                 lines.append(f"🎯 Nearest pool: {_fmt_inr(target)}")
 
+        if actual_time_str:
+            lines.append(f"📍 Chart Anchor (Swing {actual_side}): {actual_time_str} IST")
+
         # Swing confirmation - EXACTLY matches Pine's wording
-        lines.append(f"Swing confirmed {self.params.piv_len} bars after the actual {swing_word} (non-repainting)")
-
-        # Bar times - both actual swing (where label is drawn) and confirmation (where alert fires)
-        # This makes telegram 100% traceable to chart
+        lines.append(f"⚡ Swing confirmed {self.params.piv_len} bars after actual {swing_word} (non-repainting)")
         lines.append(f"Bar: {conf_time_str} IST")
-        if actual_ts is not None:
-            lines.append(f"Actual {actual_side}: {actual_time_str} IST")
 
-        # Optional: add ATR for debugging exact match with chart (commented, but useful for parity check)
-        # lines.append(f"ATR: {_fmt_inr(atr)}")
-
-        if target is not None and target == target:   # NaN-safe check
-            lines.append(f"🎯 Nearest pool: {_fmt_inr(target)}")
-        lines += [
-            anchor_txt,
-            swing_txt,
-            f"Bar: {ts.strftime('%Y-%m-%d %H:%M')} IST",
-        ]
         return "\n".join(lines)
 
     def _build_sweep_msg(self, side: str, tf, ts, row, bar) -> str:
@@ -363,14 +337,17 @@ class LiveScanner:
             head = f"🧹 SSL SWEPT (Bullish Reclaim) — {sym} ({tf})"
             arrow = "📈"
             kind_txt = "Sell-side liquidity pool"
-            # Extra detail: close vs level
+            tone = "bullish (price reclaimed)"
             detail = f"Close {_fmt_inr(close)} > level {_fmt_inr(lvl)}" if close == close else ""
+            marker = "📍 Chart Marker: ▲ Green Triangle below bar"
         else:
             lvl = row["swept_bsl_lvl"]
             head = f"🧹 BSL SWEPT (Bearish Rejection) — {sym} ({tf})"
             arrow = "📉"
             kind_txt = "Buy-side liquidity pool"
+            tone = "bearish (price failed above)"
             detail = f"Close {_fmt_inr(close)} < level {_fmt_inr(lvl)}" if close == close else ""
+            marker = "📍 Chart Marker: ▼ Red Triangle above bar"
 
         lines = [
             head,
@@ -378,5 +355,6 @@ class LiveScanner:
         ]
         if detail:
             lines.append(detail)
+        lines.append(marker)
         lines.append(f"Bar: {ts.strftime('%Y-%m-%d %H:%M')} IST")
         return "\n".join(lines)

@@ -175,16 +175,18 @@ def test_signal_message_pool_mapping():
         sig = compute_signals(df, p)
         sc = _scanner_for(p, state)
 
-        msg = sc._build_signal_msg("SELL", "5m", df.index[28], sig.iloc[28], df.iloc[28], None)
+        msg = sc._build_signal_msg("SELL", "5m", df.index[28], sig.iloc[28], df.iloc[28], df.index[20])
         assert "BSL-01" in msg, f"default SELL must name the fresh BSL pool:\n{msg}"
         assert "@ 120.00" in msg, msg
         assert "actual HIGH" in msg, msg
+        assert "Chart Anchor (Swing High): 2026-08-01 10:55 IST" in msg
         assert sc._level_of("SELL", sig.iloc[28]) == 120.0
 
-        msg = sc._build_signal_msg("BUY", "5m", df.index[33], sig.iloc[33], df.iloc[33], None)
+        msg = sc._build_signal_msg("BUY", "5m", df.index[33], sig.iloc[33], df.iloc[33], df.index[25])
         assert "SSL-01" in msg, f"default BUY must name the fresh SSL pool:\n{msg}"
         assert "@ 70.00" in msg, msg
         assert "actual LOW" in msg, msg
+        assert "Chart Anchor (Swing Low): 2026-08-01 11:20 IST" in msg
         assert sc._level_of("BUY", sig.iloc[33]) == 70.0
 
         # ---- magnet mapping: BSL -> BUY, SSL -> SELL --------------------
@@ -192,14 +194,14 @@ def test_signal_message_pool_mapping():
         sigm = compute_signals(df, pm)
         scm = _scanner_for(pm, state)
 
-        msg = scm._build_signal_msg("BUY", "5m", df.index[28], sigm.iloc[28], df.iloc[28], None)
+        msg = scm._build_signal_msg("BUY", "5m", df.index[28], sigm.iloc[28], df.iloc[28], df.index[20])
         assert "BSL-01" in msg, f"magnet BUY must name the fresh BSL pool:\n{msg}"
         assert "@ 120.00" in msg, msg
         assert "actual HIGH" in msg, msg
         assert "pool start @ —" not in msg, "magnet BUY lost its pool level"
         assert scm._level_of("BUY", sigm.iloc[28]) == 120.0, "magnet BUY dedupe level"
 
-        msg = scm._build_signal_msg("SELL", "5m", df.index[33], sigm.iloc[33], df.iloc[33], None)
+        msg = scm._build_signal_msg("SELL", "5m", df.index[33], sigm.iloc[33], df.iloc[33], df.index[25])
         assert "SSL-01" in msg, f"magnet SELL must name the fresh SSL pool:\n{msg}"
         assert "@ 70.00" in msg, msg
         assert "actual LOW" in msg, msg
@@ -366,6 +368,7 @@ def main():
     test_state_dedupe()
     test_yfinance_column_normalization()
     test_incremental_refresh_uses_datetime_start()
+    test_webhook_payload_formatter()
     print("\nALL CHECKS PASSED ✅")
 
 
