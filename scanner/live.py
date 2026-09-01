@@ -122,6 +122,7 @@ class LiveScanner:
             log.debug("market closed — idle")
             return
         now = datetime.now(self.tz)
+        self._retry_pending(now)
         for tf in self.cfg.timeframes:
             try:
                 df = self.feed.get_bars(tf)
@@ -146,6 +147,39 @@ class LiveScanner:
             return False
         t = now.time()
         return dtime.fromisoformat(self.cfg.session_start) <= t <= dtime.fromisoformat(self.cfg.session_end)
+
+    # ------------------------------------------------------------------
+    def _retry_pending(self, now) -> None:
+        """Re-deliver alerts that previously failed (never silently dropped).
+
+        A pending alert older than `pending_max_age_min` is discarded with a
+        warning — in live markets a signal that is that stale is more
+        dangerous than a missed one.
+        """
+        if not self.state.pending:
+            return
+        max_age = pd.Timedelta(minutes=getattr(self.cfg, "pending_max_age_min", 30))
+        changed = False
+        for key, item in list(self.state.pending.items()):
+            try:
+                queued = pd.Timestamp(item.get("queued", now.isoformat()))
+                queued = queued.tz_localize(self.tz) if queued.tz is None else queued.tz_convert(self.tz)
+            except Exception:
+                queued = pd.Timestamp(now)
+            if pd.Timestamp(now) - queued > max_age:
+                log.warning("Dropping stale undelivered alert (>%s old): %s", max_age, key)
+                self.state.drop_pending(key)
+                changed = True
+                continue
+            result = self.notifier.send(item.get("text", ""))
+            if result is False:
+                log.warning("Retry failed, will try again next cycle: %s", key)
+            else:
+                self.state.mark(key)
+                log.info("Pending alert delivered on retry: %s", key)
+                changed = True
+        if changed:
+            self.state.persist()
 
     # ------------------------------------------------------------------
     def _process_new_closed_bars(self, tf, df, sig, now) -> None:
@@ -177,8 +211,18 @@ class LiveScanner:
             if len(new_bars) == 0:
                 return
 
+        # Never alert stale bars (e.g. after a restart with an old state file
+        # or a long data outage): a signal from 30 minutes ago is not tradable.
+        max_age = pd.Timedelta(minutes=getattr(self.cfg, "max_alert_age_min", 10))
+        cutoff = pd.Timestamp(now) - max_age
+        stale = [ts for ts in new_bars if (ts + delta) < cutoff]
+        fresh = [ts for ts in new_bars if (ts + delta) >= cutoff]
+        if stale:
+            log.warning("[%s] skipping %d stale bar(s) older than %s min (restart/outage catch-up)",
+                        tf, len(stale), getattr(self.cfg, "max_alert_age_min", 10))
+
         changed = False
-        for ts in new_bars:
+        for ts in fresh:
             row = sig.loc[ts]
             bar = df.loc[ts]
             changed |= self._emit_bar(tf, ts, row, bar, df)

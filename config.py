@@ -56,6 +56,10 @@ class ScannerConfig:
 
     # --- alert options ---
     sweep_alerts: bool = _env_bool("SWEEP_ALERTS", True)
+    # never send signals for bars older than this (restart/outage catch-up guard)
+    max_alert_age_min: int = int(os.getenv("MAX_ALERT_AGE_MIN", "10"))
+    # failed deliveries are retried for up to this long, then dropped with a warning
+    pending_max_age_min: int = int(os.getenv("PENDING_MAX_AGE_MIN", "30"))
 
     # --- webhook server (zero-delay direct TradingView alerts) ---
     webhook_host: str = os.getenv("WEBHOOK_HOST", "0.0.0.0")

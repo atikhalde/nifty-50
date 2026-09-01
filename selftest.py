@@ -229,6 +229,17 @@ def test_state_dedupe():
         s2 = SentState(path)                        # reload from disk
         assert s2.already_sent(key), "dedupe must survive restart"
         assert s2.last_evaluated["5m"] == "2026-08-31T14:35:00+05:30"
+
+        # pending queue: survives restart, cleared once delivered
+        s2.add_pending("k2", "hello", "2026-08-31T14:36:00+05:30")
+        s2.persist()
+        s3 = SentState(path)
+        assert "k2" in s3.pending and s3.pending["k2"]["text"] == "hello"
+        s3.mark("k2")
+        assert "k2" not in s3.pending and s3.already_sent("k2")
+        # marking as sent blocks re-queueing
+        s3.add_pending("k2", "hello", "2026-08-31T14:37:00+05:30")
+        assert "k2" not in s3.pending
     print("  ok  persistent dedupe across restarts")
 
 

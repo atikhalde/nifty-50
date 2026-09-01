@@ -20,7 +20,6 @@ import logging.handlers
 import sys
 
 from config import ScannerConfig
-from scanner.alerts.telegram import TelegramNotifier
 from scanner.data.mock import MockFeed
 from scanner.indicators.bsl_ssl import BSLSSLParams
 from scanner.live import LiveScanner
@@ -77,6 +76,7 @@ def main() -> int:
 
     if args.mock:
         cfg.market_hours_only = False   # synthetic data is always "open"
+        cfg.max_alert_age_min = 10**6   # mock bars are timestamped in the past
         if not args.once:
             cfg.scan_interval_sec = min(cfg.scan_interval_sec, 2)  # faster demo
 
