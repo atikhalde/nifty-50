@@ -1,0 +1,106 @@
+# NIFTY BSL/SSL Scanner — cloud runs (GitHub Actions)
+#
+# Scheduled: every 5 minutes, Mon–Fri, during NSE hours (09:15–15:30 IST =
+# 03:45–10:00 UTC). Each run is a FRESH machine, so it:
+#   1. restores the alert-dedupe state (data/sent_alerts.json) from cache,
+#   2. scans the last LOOKBACK_MINUTES of closed 5m bars (engine warmed up
+#      on full history, alerts only on the recent window),
+#   3. sends BUY / SELL / 🧹 sweep alerts to BOTH Telegram bots,
+#   4. saves the updated dedupe state back to the cache.
+#
+# Because every alert key is persisted in the cached state file, the same bar
+# can NEVER be alerted twice, no matter how many fresh runs replay it.
+#
+# Manual: Actions tab -> "NIFTY BSL/SSL Scanner" -> Run workflow.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   BOT1_TOKEN, BOT2_TOKEN, CHAT_ID, CHAT_ID_2 (optional, defaults to CHAT_ID)
+
+name: NIFTY BSL/SSL Scanner
+
+on:
+  schedule:
+    # every 5 min, 03:45–10:00 UTC (= 09:15–15:30 IST), Mon–Fri.
+    # The run itself also gates on IST market hours (see below).
+    - cron: "*/5 3-10 * * 1-5"
+  workflow_dispatch: {}          # manual "Run workflow" button
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nifty-scanner
+  cancel-in-progress: false      # never kill a run mid-scan
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      TZ: Asia/Kolkata
+      SYMBOL: "^NSEI"
+      DISPLAY_SYMBOL: "NSE:NIFTY"
+      TIMEFRAMES: "5m"
+      LOOKBACK_MINUTES: "20"
+      MARKET_HOURS_ONLY: "false"    # the cron schedule encodes NSE hours
+      TELEGRAM_ENABLED: "true"
+      BOT1_TOKEN: ${{ secrets.BOT1_TOKEN }}
+      BOT2_TOKEN: ${{ secrets.BOT2_TOKEN }}
+      CHAT_ID: ${{ secrets.CHAT_ID }}
+      CHAT_ID_2: ${{ secrets.CHAT_ID_2 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Gate on NSE market hours (scheduled runs)
+        if: github.event_name == 'schedule'
+        run: |
+          python - <<'PY'
+          import sys
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          now = datetime.now(ZoneInfo("Asia/Kolkata"))
+          t = now.strftime("%H:%M")
+          if not ("09:15" <= t <= "15:30"):
+              print(f"Outside NSE hours ({t} IST) — skipping run.")
+              sys.exit(0)
+          print(f"Inside NSE hours ({t} IST) — scanning.")
+          PY
+
+      - name: Ensure dedupe state file exists
+        run: mkdir -p data && touch data/sent_alerts.json
+
+      - name: Restore alert state (dedupe cache)
+        id: cache-state
+        uses: actions/cache@v4
+        with:
+          path: data/sent_alerts.json
+          key: sent-alerts-placeholder
+          restore-keys: |
+            sent-alerts-
+
+      - name: Trim old alert keys
+        run: python scanner/prune_state.py --state data/sent_alerts.json --max-age-days 14
+
+      - name: Scan (lookback)
+        run: |
+          echo "LOOKBACK_MINUTES=$LOOKBACK_MINUTES  TF=$TIMEFRAMES  symbol=$SYMBOL"
+          python run_scanner.py --lookback "$LOOKBACK_MINUTES"
+
+      - name: Save alert state (dedupe cache)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/sent_alerts.json
+          key: sent-alerts-${{ github.run_id }}-${{ hashFiles('data/sent_alerts.json') }}
