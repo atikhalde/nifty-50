@@ -205,4 +205,8 @@ class YFinanceFeed:
             return s_t <= t < e_t
 
         mask = df.index.to_series().apply(_inside)
+        """Keep only bars whose timestamp falls inside the NSE session."""
+        s, e = self.session_start, self.session_end
+        mask = df.index.to_series().apply(
+            lambda ts: s <= ts.strftime("%H:%M") <= e)
         return df[mask]

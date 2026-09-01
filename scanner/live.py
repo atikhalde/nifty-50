@@ -72,6 +72,11 @@ class LiveScanner:
             chat_id=cfg.chat_id, chat_id_2=cfg.chat_id_2,
             enabled=cfg.telegram_enabled,
         )
+        # Lookback mode (cloud/Actions): the engine runs on the FULL warm-up
+        # window so its pool state converges exactly like a live scanner, but
+        # alerts fire only for closed bars inside the last `lookback_minutes`.
+        # Alert dedupe comes from the cached `data/sent_alerts.json` (shared
+        # across fresh machines), NOT from last_evaluated.
         self.lookback_minutes = int(lookback_minutes or 0)
         self.market_check = market_check
 
@@ -96,6 +101,9 @@ class LiveScanner:
             self.state.persist()
 
     def tick(self) -> None:
+        # In lookback mode the schedule already encodes market hours — never
+        # gate on the local clock (an Actions run is a fresh machine, and the
+        # cached window is what matters).
         if (self.market_check and self.cfg.market_hours_only
                 and not self.lookback_minutes and not self._market_open()):
             log.debug("market closed — idle")
@@ -127,11 +135,18 @@ class LiveScanner:
             return
 
         if self.lookback_minutes:
+            # Cloud lookback: the engine already ran over the full warm-up
+            # window (feed returns full history), so pool state converges like
+            # a live scanner. Alert ONLY on closed bars inside the recent
+            # lookback window; every alert key still goes through the
+            # persistent dedupe, so replaying the window on every fresh run
+            # can never send a duplicate.
             cutoff = df.index.max() - pd.Timedelta(minutes=self.lookback_minutes)
             new_bars = closed[closed > cutoff]
         else:
             last_ev = self.state.last_evaluated.get(tf)
             if last_ev is None:
+                # First run for this timeframe: baseline only, do NOT alert history.
                 self.state.set_last_evaluated(tf, closed[-1].isoformat())
                 self.state.persist()
                 log.info("[%s] baseline set at %s (skipping history)", tf, closed[-1])
@@ -163,11 +178,22 @@ class LiveScanner:
                          tf, len(new_bars), self.lookback_minutes)
             else:
                 log.info("[%s] lookback: %d closed bar(s) in window, nothing new to send", tf, len(new_bars))
+                # persist ONLY on change — a no-change run leaves the cached
+                # state file untouched (no useless cache churn every 5 min)
+                self.state.persist()
+                log.info("[%s] lookback: %d closed bar(s) in the last %dm "
+                         "window, alerts fired",
+                         tf, len(new_bars), self.lookback_minutes)
+            else:
+                log.info("[%s] lookback: %d closed bar(s) in window, nothing "
+                         "new to send", tf, len(new_bars))
         else:
             self.state.set_last_evaluated(tf, new_bars[-1].isoformat())
             self.state.persist()
             if changed:
                 log.info("[%s] processed %d new closed bar(s), last=%s", tf, len(new_bars), new_bars[-1])
+                log.info("[%s] processed %d new closed bar(s), last=%s",
+                         tf, len(new_bars), new_bars[-1])
 
     # ------------------------------------------------------------------
     def _emit_bar(self, tf, ts, row, bar, actual_ts, df) -> bool:
@@ -193,6 +219,11 @@ class LiveScanner:
             if result is False:
                 if self.lookback_minutes:
                     log.warning("Alert delivery failed in lookback run, will try next run: %s", key)
+                    # one-shot run: log and move on — the same bar will be
+                    # inside the next run's window, but the key was NOT marked,
+                    # so it gets exactly one more chance next run
+                    log.warning("Alert delivery failed in lookback run, will try "
+                                "next run: %s", key)
                 else:
                     log.warning("Alert delivery failed, will retry next cycle: %s", key)
             else:
@@ -244,6 +275,11 @@ class LiveScanner:
         entry = float(bar["close"])
         atr = float(row["atr"]) if row["atr"] == row["atr"] else 0.0
 
+        # Pool mapping mirrors the Pine script:
+        #   default (fade):  buyPool = new SSL, sellPool = new BSL
+        #                    buyTgt  = nextBSL, sellTgt  = nextSSL
+        #   magnet:          buyPool = new BSL, sellPool = new SSL
+        #                    buyTgt  = new BSL, sellTgt  = new SSL (the pool itself)
         magnet = self.params.magnet
         if side == "BUY":
             if magnet:
@@ -270,6 +306,28 @@ class LiveScanner:
                 swing_word = "HIGH"
                 actual_side = "HIGH"
             sl, tp = row["sl_short"], row["tp_short"]
+                target = row["new_bsl_lvl"]
+                swing_word = "HIGH"
+            else:
+                pool_name, pool_lvl = row["new_ssl_name"], row["new_ssl_lvl"]
+                target = row["next_bsl"]
+                swing_word = "LOW"
+            sl, tp = row["sl_long"], row["tp_long"]
+            swing_txt = (f"Swing confirmed {self.params.piv_len} bars after the "
+                         f"actual {swing_word} (non-repainting)")
+            head = f"🟢 BUY SIGNAL — {sym} ({tf})"
+        else:
+            if magnet:
+                pool_name, pool_lvl = row["new_ssl_name"], row["new_ssl_lvl"]
+                target = row["new_ssl_lvl"]
+                swing_word = "LOW"
+            else:
+                pool_name, pool_lvl = row["new_bsl_name"], row["new_bsl_lvl"]
+                target = row["next_ssl"]
+                swing_word = "HIGH"
+            sl, tp = row["sl_short"], row["tp_short"]
+            swing_txt = (f"Swing confirmed {self.params.piv_len} bars after the "
+                         f"actual {swing_word} (non-repainting)")
             head = f"🔴 SELL SIGNAL — {sym} ({tf})"
 
         # Format times
@@ -305,6 +363,12 @@ class LiveScanner:
         # Optional: add ATR for debugging exact match with chart (commented, but useful for parity check)
         # lines.append(f"ATR: {_fmt_inr(atr)}")
 
+        if target is not None and target == target:   # NaN-safe check
+            lines.append(f"🎯 Nearest pool: {_fmt_inr(target)}")
+        lines += [
+            swing_txt,
+            f"Bar: {ts.strftime('%Y-%m-%d %H:%M')} IST",
+        ]
         return "\n".join(lines)
 
     def _build_sweep_msg(self, side: str, tf, ts, row, bar) -> str:
