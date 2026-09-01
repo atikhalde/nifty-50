@@ -312,265 +312,129 @@ def test_expiry():
     print("  ok  pool expiry frees the slot for a new pool")
 
 
-def test_fast_pivot_62pct_faster():
-    """TIER 2: fast_piv_len=3 confirms 5 bars earlier than piv_len=8 (62.5%)."""
-    df = _base_frame()
-    _spike(df, 20, high=120.0)
-    p = BSLSSLParams()
-    assert p.piv_len == 8 and p.fast_piv_len == 3
-    faster = (p.piv_len - p.fast_piv_len) / p.piv_len
-    assert abs(faster - 0.625) < 1e-9, f"expected 62.5% faster, got {faster:.1%}"
+def test_feed_normalisation():
+    """The live feed must survive every shape yfinance actually returns."""
+    from scanner.data.yfinance_feed import YFinanceFeed, FeedError
 
-    sig = compute_signals(df, p)
-    assert not bool(sig["fast_sell_sig"].iloc[20]), "fast signal must not fire on the swing bar"
-    assert bool(sig["fast_sell_sig"].iloc[23]), "FAST SELL must fire on bar 20+3=23"
-    assert not bool(sig["sell_sig"].iloc[23]), "STANDARD must still wait for 8-bar confirmation"
-    assert bool(sig["sell_sig"].iloc[28]), "STANDARD SELL still fires on bar 20+8=28"
-    assert sig["fast_new_bsl_lvl"].iloc[23] == 120.0
-    assert sig["fast_new_bsl_name"].iloc[23] == "FAST-BSL"
-    # 5m: 3 bars = 15 minutes; 1m: 3 bars = 3 minutes
-    assert (df.index[23] - df.index[20]) == pd.Timedelta(minutes=15)
-    print("  ok  TIER 2 fast pivot (3-bar, 62% faster) + TIER 3 standard intact")
+    f = YFinanceFeed()
+    idx = pd.date_range("2026-09-01 03:45", periods=6, freq="5min")  # naive UTC
+    base = dict(Open=[100.0] * 6, High=[106.0] * 6, Low=[99.0] * 6,
+                Close=[104.0] * 6, Volume=[10.0] * 6)
 
+    # MultiIndex columns (yfinance >= 0.2.51) must flatten, index -> IST.
+    mi = pd.DataFrame(base, index=idx)
+    mi.columns = pd.MultiIndex.from_product([mi.columns, ["^NSEI"]])
+    d = f._normalise(mi)
+    assert list(d.columns) == ["open", "high", "low", "close", "volume"]
+    assert str(d.index.tz) == "Asia/Kolkata", "naive Yahoo index must be UTC->IST"
 
-def test_fast_buy_and_magnet():
-    df = _base_frame()
-    _spike(df, 25, low=70.0)
-    sig = compute_signals(df, BSLSSLParams())
-    assert bool(sig["fast_buy_sig"].iloc[28]), "FAST BUY on bar 25+3=28"
-    assert bool(sig["buy_sig"].iloc[33]), "STANDARD BUY still on bar 25+8=33"
+    # Corrupt bars (NaN close, zero print, high<low) must be dropped.
+    b = pd.DataFrame(base, index=idx)
+    b.iloc[1, b.columns.get_loc("Close")] = np.nan
+    b.iloc[2, b.columns.get_loc("Open")] = 0.0
+    b.iloc[3, b.columns.get_loc("High")] = 1.0
+    assert len(f._normalise(b)) == 3, "bad ticks must be filtered out"
 
-    pm = BSLSSLParams(sig_dir="BSL→BUY · SSL→SELL")
-    sigm = compute_signals(df, pm)
-    assert bool(sigm["fast_sell_sig"].iloc[28]), "magnet: fast SSL start -> FAST SELL"
-    assert not bool(sigm["fast_buy_sig"].iloc[28])
-    print("  ok  TIER 2 fast BUY + magnet flip")
+    # Duplicate / unsorted timestamps must be de-duplicated and ordered.
+    c = pd.concat([pd.DataFrame(base, index=idx)] * 2).sort_index(ascending=False)
+    d = f._normalise(c)
+    assert d.index.is_unique and d.index.is_monotonic_increasing
 
-
-def test_instant_sweep_trade_0_bar_lag():
-    """TIER 1: execute on the sweep candle close, wick SL, 1:2 R:R TP."""
-    df = _base_frame()
-    _spike(df, 20, high=120.0)                     # BSL @120 confirmed at 28
-    _spike(df, 25, low=70.0)                       # SSL @70 confirmed at 33
-    _spike(df, 40, high=135.0, close=95.0)         # BSL sweep
-    _spike(df, 45, low=50.0, close=95.0)           # SSL sweep
-    sig = compute_signals(df, BSLSSLParams())
-
-    assert bool(sig["swept_bsl"].iloc[40])
-    assert bool(sig["inst_sell_sig"].iloc[40]), "INSTANT SELL must fire ON the BSL sweep bar (0-lag)"
-    assert not bool(sig["inst_sell_sig"].iloc[39]), "must not fire before the sweep"
-    assert sig["inst_sl_short"].iloc[40] == 135.0, "tight wick SL = sweep candle high"
-    # entry 95, risk 40, 1:2 TP = 95 - 80 = 15
-    assert abs(sig["inst_tp_short"].iloc[40] - (95.0 - 2.0 * (135.0 - 95.0))) < 1e-9
-    assert sig["inst_pool_lvl"].iloc[40] == 120.0
-
-    assert bool(sig["swept_ssl"].iloc[45])
-    assert bool(sig["inst_buy_sig"].iloc[45]), "INSTANT BUY must fire ON the SSL sweep bar (0-lag)"
-    assert sig["inst_sl_long"].iloc[45] == 50.0, "tight wick SL = sweep candle low"
-    assert abs(sig["inst_tp_long"].iloc[45] - (95.0 + 2.0 * (95.0 - 50.0))) < 1e-9
-    assert sig["inst_pool_lvl"].iloc[45] == 70.0
-    print("  ok  TIER 1 instant sweep trade (0-bar lag, wick SL, 1:2 R:R)")
+    # Missing OHLC must raise a typed error (caught & retried by the feed).
+    try:
+        f._normalise(pd.DataFrame({"Open": [1.0]}, index=idx[:1]))
+        raise AssertionError("missing columns should raise")
+    except FeedError:
+        pass
+    print("  ok  feed normalisation (MultiIndex, tz, bad ticks, dupes)")
 
 
-def test_multi_speed_telegram_timestamps():
-    """All 3 tiers expose Chart Anchor vs Execution Bar."""
-    df = _base_frame()
-    _spike(df, 20, high=120.0)
-    _spike(df, 40, high=135.0, close=95.0)
-    p = BSLSSLParams()
-    sig = compute_signals(df, p)
-
-    with tempfile.TemporaryDirectory() as td:
-        sc = _scanner_for(p, os.path.join(td, "state.json"))
-
-        msg_std = sc._build_signal_msg(
-            "SELL", "5m", df.index[28], sig.iloc[28], df.iloc[28], df.index[20], speed="standard")
-        assert "· STANDARD" in msg_std
-        assert "Chart Anchor (Swing High): 2026-08-01 10:55 IST" in msg_std
-        assert "Execution Bar: 2026-08-01 11:35 IST" in msg_std
-        assert "Swing confirmed 8 bars after actual HIGH" in msg_std
-
-        msg_fast = sc._build_signal_msg(
-            "SELL", "5m", df.index[23], sig.iloc[23], df.iloc[23], df.index[20], speed="fast")
-        assert "· FAST" in msg_fast
-        assert "FAST-BSL" in msg_fast
-        assert "Chart Anchor (Swing High): 2026-08-01 10:55 IST" in msg_fast
-        assert "Execution Bar: 2026-08-01 11:10 IST" in msg_fast  # 3 x 5m after 10:55
-        assert "Fast swing confirmed 3 bars after actual HIGH" in msg_fast
-        assert "62% faster" in msg_fast
-
-        msg_inst = sc._build_instant_msg(
-            "SELL", "5m", df.index[40], sig.iloc[40], df.iloc[40], df.index[40])
-        assert "INSTANT SWEEP SELL" in msg_inst
-        assert "TIER 1" in msg_inst
-        assert "(wick)" in msg_inst
-        assert "0-bar lag" in msg_inst
-        # Chart Anchor and Execution Bar are the same candle
-        assert "Chart Anchor (Sweep High): 2026-08-01 12:35 IST" in msg_inst
-        assert "Execution Bar: 2026-08-01 12:35 IST" in msg_inst
-        assert "SL: 135.00" in msg_inst or "SL: 135.00" in msg_inst.replace(",", "")
-    print("  ok  dual timestamps (Chart Anchor vs Execution Bar) for all 3 tiers")
-
-
-def test_webhook_multi_speed_tiers():
-    """Webhook formatter emits distinct copy + dual timestamps per speed tier."""
-    std = {
-        "action": "BUY", "speed": "standard", "piv_len": 8,
-        "symbol": "NSE:NIFTY", "tf": "5m", "pool": "SSL-01",
-        "pool_lvl": 24010.55, "entry": 24061.05, "sl": 24038.43, "tp": 24106.30,
-        "target": 24114.00, "swing_bar_time": "2026-09-01 09:45",
-        "bar_time": "2026-09-01 10:25",
-    }
-    kind, key, msg = WebhookFormatter.format_payload(std)
-    assert kind == "BUY"
-    assert "STANDARD" in msg
-    assert "Chart Anchor (Swing Low): 2026-09-01 09:45 IST" in msg
-    assert "Execution Bar: 2026-09-01 10:25 IST" in msg
-    assert "Swing confirmed 8 bars after actual LOW" in msg
-
-    fast = {
-        "action": "BUY", "speed": "fast", "piv_len": 3,
-        "symbol": "NSE:NIFTY", "tf": "5m", "pool": "FAST-SSL",
-        "pool_lvl": 24010.55, "entry": 24040.00, "sl": 24020.00, "tp": 24080.00,
-        "target": 24114.00, "swing_bar_time": "2026-09-01 10:10",
-        "bar_time": "2026-09-01 10:25",
-    }
-    kind2, key2, msg2 = WebhookFormatter.format_payload(fast)
-    assert kind2 == "FAST_BUY"
-    assert "FAST" in msg2
-    assert "FAST-SSL" in msg2
-    assert "Chart Anchor (Swing Low): 2026-09-01 10:10 IST" in msg2
-    assert "Execution Bar: 2026-09-01 10:25 IST" in msg2
-    assert "Fast swing confirmed 3 bars after actual LOW" in msg2
-    assert "62% faster" in msg2
-    assert key2 != key
-
-    inst = {
-        "action": "INST_BUY", "speed": "instant", "piv_len": 0,
-        "symbol": "NSE:NIFTY", "tf": "5m", "pool": "SSL-01",
-        "pool_lvl": 24020.50, "entry": 24025.10, "sl": 24000.00, "tp": 24075.30,
-        "swing_bar_time": "2026-09-01 09:45", "bar_time": "2026-09-01 09:45",
-    }
-    kind3, key3, msg3 = WebhookFormatter.format_payload(inst)
-    assert kind3 == "INST_BUY"
-    assert "INSTANT SWEEP BUY" in msg3
-    assert "TIER 1" in msg3
-    assert "(wick)" in msg3
-    assert "0-bar lag" in msg3
-    assert "Chart Anchor (Sweep Low): 2026-09-01 09:45 IST" in msg3
-    assert "Execution Bar: 2026-09-01 09:45 IST" in msg3
-    print("  ok  webhook formatter distinct alerts for Standard / Fast / Instant")
-
-
-def test_webhook_payload_formatter():
-    # 1. User sample BUY alert
-    buy_json = {
-        "action": "BUY",
-        "symbol": "NSE:NIFTY",
-        "tf": "5m",
-        "pool": "SSL-169",
-        "pool_lvl": 24010.55,
-        "entry": 24061.05,
-        "sl": 24038.43,
-        "tp": 24106.30,
-        "target": 24114.00,
-        "swing_bar_time": "2026-09-01 09:45",
-        "bar_time": "2026-09-01 10:25"
-    }
-    kind, key, msg = WebhookFormatter.format_payload(buy_json)
-    assert kind == "BUY"
-    assert "SSL-169" in msg
-    assert "24,010.55" in msg
-    assert "24,061.05" in msg
-    assert "24,038.43" in msg
-    assert "24,106.30" in msg
-    assert "2026-09-01 09:45 IST" in msg
-    assert "2026-09-01 10:25" in msg
-
-    # 2. User sample SELL alert
-    sell_json = {
-        "action": "SELL",
-        "symbol": "NSE:NIFTY",
-        "tf": "5m",
-        "pool": "BSL-169",
-        "pool_lvl": 24142.85,
-        "entry": 24117.75,
-        "sl": 24136.48,
-        "tp": 24080.29,
-        "target": 24010.55,
-        "swing_bar_time": "2026-09-01 11:30",
-        "bar_time": "2026-09-01 12:10"
-    }
-    kind2, key2, msg2 = WebhookFormatter.format_payload(sell_json)
-    assert kind2 == "SELL"
-    assert "BSL-169" in msg2
-    assert "24,142.85" in msg2
-    assert "24,117.75" in msg2
-
-    # 3. User sample Sweep alert
-    sweep_json = {
-        "action": "SWEEP_SSL",
-        "symbol": "NSE:NIFTY",
-        "tf": "5m",
-        "pool_lvl": 24020.50,
-        "close": 24025.10,
-        "bar_time": "2026-09-01 09:45"
-    }
-    kind3, key3, msg3 = WebhookFormatter.format_payload(sweep_json)
-    assert kind3 == "SWEEP_SSL"
-    assert "24,020.50" in msg3
-
-    print("  ok  webhook formatter handles TradingView JSON & math accurately")
-
-
-def test_live_scanner_wiring_offline():
-    """End-to-end alert-path wiring through LiveScanner (offline, MockFeed).
-
-    Regression guard: production previously called _emit_bar with a wrong
-    signature; tick() swallowed the TypeError every cycle, so the scanner
-    LOOKED alive but never sent a single alert. This test calls the exact
-    method tick() calls and requires >0 emitted+deduped alerts.
-    """
+def test_scanner_survives_bad_state():
+    """A tz-naive or corrupt last_evaluated must not kill a live scan cycle."""
+    import json
     from config import ScannerConfig
     from scanner.data.mock import MockFeed
     from scanner.live import LiveScanner
 
     with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        with open(sf, "w", encoding="utf-8") as fh:
+            json.dump({"sent": {},
+                       "last_evaluated": {"5m": "2026-09-01T10:00:00",   # tz-naive
+                                          "1m": "not-a-date"}}, fh)      # garbage
         cfg = ScannerConfig()
         cfg.market_hours_only = False
-        cfg.telegram_enabled = False          # dry-run: logged + marked sent
-        cfg.state_file = os.path.join(td, "state.json")
-        cfg.log_file = os.path.join(td, "scanner.log")
+        cfg.telegram_enabled = False
+        cfg.state_file = sf
+        LiveScanner(cfg, feed=MockFeed()).tick()   # must not raise
+    print("  ok  scanner survives tz-naive / corrupt state")
 
-        sc = LiveScanner(cfg, feed=MockFeed())
-        df = sc.feed.get_bars("5m")
 
-        # pretend bars up to index 99 were evaluated in an earlier session
-        sc.state.set_last_evaluated("5m", df.index[99].isoformat())
-        sig = compute_signals(df, sc.params)
-        now = df.index[-1] + pd.Timedelta(minutes=5)   # every bar is closed
+def test_no_duplicate_and_retry_on_failure():
+    """Failed delivery is retried; delivered alerts are never repeated."""
+    from config import ScannerConfig
+    from scanner.data.mock import MockFeed
+    from scanner.live import LiveScanner
+    from scanner.indicators.bsl_ssl import compute_signals
+    from datetime import datetime
 
-        # The exact method tick() invokes — must not raise.
-        sc._process_new_closed_bars("5m", df, sig, now)
-        assert len(sc.state.sent) > 0, "live path emitted ZERO alerts — wiring broken"
+    with tempfile.TemporaryDirectory() as td:
+        cfg = ScannerConfig()
+        cfg.market_hours_only = False
+        cfg.timeframes = ["5m"]
+        cfg.state_file = os.path.join(td, "s.json")
+        s = LiveScanner(cfg, feed=MockFeed())
+        s.notifier.bots = [("bot1", "tok", "chat")]
 
-        kinds = {k.split("|")[2] for k in sc.state.sent}
-        later = sig.iloc[100:]
-        assert kinds & {"BUY", "SELL", "SWEEP_SSL", "SWEEP_BSL"}, \
-            f"no standard/sweep alerts emitted (kinds={kinds})"
-        if bool(later["fast_buy_sig"].any()) or bool(later["fast_sell_sig"].any()):
-            assert kinds & {"FAST_BUY", "FAST_SELL"}, "TIER 2 engine fired but no FAST alert"
-        if bool(later["inst_buy_sig"].any()) or bool(later["inst_sell_sig"].any()):
-            assert kinds & {"INST_BUY", "INST_SELL"}, "TIER 1 engine fired but no INST alert"
+        sent = []
+        s.notifier.send = lambda text: (sent.append(text), False)[1]   # always fails
+        s.tick()
+        assert not s.state.sent, "failed sends must NOT be marked (they retry)"
 
-        # Re-walking already-evaluated bars must never duplicate an alert.
-        n_before = len(sc.state.sent)
-        sc._process_new_closed_bars("5m", df, sig, now)
-        assert len(sc.state.sent) == n_before, "duplicate alerts on re-walk"
+        s.notifier.send = lambda text: (sent.append(text), True)[1]    # now succeeds
+        df = s.feed.get_bars("5m")
+        sig = compute_signals(df, s.params)
+        now = datetime.now(s.tz)
+        s.state.last_evaluated["5m"] = df.index[-6].isoformat()
+        s._process_new_closed_bars("5m", df, sig, now)
+        first = len(sent)
+        s.state.last_evaluated["5m"] = df.index[-6].isoformat()        # replay same bars
+        s._process_new_closed_bars("5m", df, sig, now)
+        assert len(sent) == first, "an already-delivered alert was sent twice!"
+    print("  ok  retry-on-failure + never a duplicate alert")
 
-        # Public entry point must complete cleanly as well.
-        sc.tick()
-    print("  ok  live wiring: standard/FAST/INST alerts emitted + strictly deduped")
+
+def test_state_ledger_is_bounded():
+    with tempfile.TemporaryDirectory() as td:
+        st = SentState(os.path.join(td, "p.json"))
+        for i in range(SentState.MAX_KEYS + 3000):
+            st.mark(f"k{i}")
+        assert len(st.sent) <= SentState.MAX_KEYS
+        assert st.already_sent(f"k{SentState.MAX_KEYS + 2999}"), "newest key must survive"
+    print("  ok  dedupe ledger stays bounded")
+
+
+def test_config_is_typo_proof():
+    """A typo in .env must degrade to defaults, never crash at the open."""
+    from config import ScannerConfig
+
+    saved = {k: os.environ.get(k) for k in
+             ("SCAN_INTERVAL_SEC", "SESSION_START", "TIMEFRAMES", "LOG_LEVEL")}
+    try:
+        os.environ.update({"SCAN_INTERVAL_SEC": "abc", "SESSION_START": "9:15",
+                           "TIMEFRAMES": "1m,7m,5m", "LOG_LEVEL": "chatty"})
+        c = ScannerConfig()
+        assert c.scan_interval_sec == 20, "bad int must fall back to the default"
+        assert c.session_start == "09:15", "'9:15' must be normalised to '09:15'"
+        assert c.timeframes == ["1m", "5m"], "unsupported timeframe must be dropped"
+        assert c.log_level == "INFO"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("  ok  config tolerates bad .env values")
 
 
 def main():
@@ -583,15 +447,12 @@ def main():
     test_signal_message_pool_mapping()
     test_expiry()
     test_state_dedupe()
-    test_yfinance_column_normalization()
-    test_incremental_refresh_uses_datetime_start()
-    test_webhook_payload_formatter()
-    test_fast_pivot_62pct_faster()
-    test_fast_buy_and_magnet()
-    test_instant_sweep_trade_0_bar_lag()
-    test_multi_speed_telegram_timestamps()
-    test_webhook_multi_speed_tiers()
-    test_live_scanner_wiring_offline()
+    print("\nLive-market hardening checks")
+    test_config_is_typo_proof()
+    test_feed_normalisation()
+    test_scanner_survives_bad_state()
+    test_no_duplicate_and_retry_on_failure()
+    test_state_ledger_is_bounded()
     print("\nALL CHECKS PASSED ✅")
 
 

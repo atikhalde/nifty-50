@@ -1,55 +1,28 @@
-"""yfinance data feed for the BSL/SSL scanner (NSE:NIFTY, ``^NSEI``).
+"""Yahoo Finance intraday feed for NSE:NIFTY (^NSEI).
 
-Responsibilities
-----------------
-* Pull enough history to warm up the pool state so it converges to the
-  TradingView chart (~7 trading days of 1m bars, ~60 days of 5m bars), then
-  refresh incrementally on every scan.
-* Return a clean OHLC ``DataFrame`` with **lowercase** columns
-  (``open, high, low, close, volume``) and a **timezone-aware** index in the
-  configured session timezone (IST by default) — ``scanner/live.py`` relies on
-  the index being tz-aware for its closed-bar / dedupe arithmetic.
-* Filter intraday bars to the NSE cash session (``09:15``–``15:30`` IST) so the
-  bars line up 1:1 with TradingView.
-
-yfinance is free and unofficial; Yahoo can throttle or drop connections, so
-every network call is wrapped and failures degrade gracefully (an empty frame),
-never crash the scan loop.
-"""Yahoo Finance bar feed for the scanner.
-
-Provides a warm-up window (enough history for the pool state to converge with
-a TradingView chart) plus an incremental cache so only new bars are fetched on
-each scan cycle. Intraday bars are filtered to the NSE session
-(09:15-15:30 IST) so they match TradingView.
+Design goals (live-market safety):
+  * NEVER raise into the scan loop — every failure returns None and is logged.
+  * Normalise whatever yfinance hands back (MultiIndex columns, naive index,
+    duplicate/uns0rted timestamps, NaN rows) into a clean OHLCV frame with a
+    tz-aware Asia/Kolkata index.
+  * Short-TTL cache so a 20 s scan cadence does not hammer Yahoo, and a
+    stale-data guard so we never re-run the engine on a frozen feed silently.
+  * Bounded retries with backoff on transient network errors.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import time as dtime
-import os
+import threading
 import time
-from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 log = logging.getLogger(__name__)
 
-# How much history to request per timeframe (warm-up + live refresh in one go).
-# Yahoo limits: 1m -> max 7 days back, 5m/15m -> max 60 days back.
-_TF_PLAN: dict[str, dict[str, str]] = {
-    "1m": {"interval": "1m", "period": "7d"},
-    "2m": {"interval": "2m", "period": "60d"},
-    "5m": {"interval": "5m", "period": "60d"},
-    "15m": {"interval": "15m", "period": "60d"},
-    "30m": {"interval": "30m", "period": "60d"},
-    "60m": {"interval": "60m", "period": "60d"},
-    "1h": {"interval": "60m", "period": "60d"},
-}
-
-# One bar's duration per timeframe — used by live.py to decide when a bar is
-# fully closed (``index + delta <= now``).
+# Bar length per supported interval — used by the scanner to decide which bars
+# have actually CLOSED (Yahoo timestamps a bar by its OPEN time).
 INTERVAL_DELTA: dict[str, pd.Timedelta] = {
     "1m": pd.Timedelta(minutes=1),
     "2m": pd.Timedelta(minutes=2),
@@ -58,350 +31,189 @@ INTERVAL_DELTA: dict[str, pd.Timedelta] = {
     "30m": pd.Timedelta(minutes=30),
     "60m": pd.Timedelta(minutes=60),
     "1h": pd.Timedelta(minutes=60),
-# ---------------------------------------------------------------------------
-# TLS hardening
-# ---------------------------------------------------------------------------
-# yfinance prefers the curl_cffi backend, whose bundled BoringSSL frequently
-# drops the handshake to query2.finance.yahoo.com in sandboxed/CI networks
-# ("BoringSSL SSL_connect ... SSL_ERROR_SYSCALL"). Forcing the plain
-# requests/OpenSSL backend makes the connection succeed there.
-#
-# yfinance reads this env var at IMPORT time (yfinance/_http.py), so it must be
-# set before the first `import yfinance` — hence at module import time here.
-# YF_USE_CURL_CFFI is also set for older/newer variants of the same knob.
-os.environ.setdefault("YF_DISABLE_CURL_CFFI", "1")
-os.environ.setdefault("YF_USE_CURL_CFFI", "0")
-
-_YF_CONFIGURED = False
-
-
-def _patch_requests_exceptions() -> None:
-    """Add curl_cffi-only exception names to ``requests.exceptions``.
-
-    With the curl_cffi backend disabled, yfinance still references
-    ``requests.exceptions.DNSError`` (a curl_cffi-only class), which raises
-    ``AttributeError: module 'requests.exceptions' has no attribute 'DNSError'``
-    and turns every successful download into an "empty response". Alias the
-    missing names onto requests' own ConnectionError so the handler works.
-    """
-    import requests
-
-    for name in ("DNSError", "CurlError", "ImpersonateError"):
-        if not hasattr(requests.exceptions, name):
-            setattr(requests.exceptions, name, requests.exceptions.ConnectionError)
-
-
-def _import_yfinance():
-    """Import yfinance with the curl_cffi backend disabled (idempotent)."""
-    global _YF_CONFIGURED
-    _patch_requests_exceptions()
-    import yfinance as yf
-
-    if not _YF_CONFIGURED:
-        _YF_CONFIGURED = True
-        try:
-            from yfinance import _http as yf_http
-            if getattr(yf_http, "HAS_CURL_CFFI", False):
-                log.warning("yfinance is using the curl_cffi backend — TLS "
-                            "handshake failures to Yahoo are likely")
-        except Exception:  # noqa: BLE001 - internal module, best effort
-            pass
-        try:
-            # Bound the internal retry budget too (kwarg absent on old versions)
-            yf.set_config(retries=3)
-        except Exception:  # noqa: BLE001
-            log.debug("yf.set_config unavailable")
-    return yf
-
-
-# Interval -> pandas timedelta
-INTERVAL_DELTA = {
-    "1m": pd.Timedelta(minutes=1),
-    "5m": pd.Timedelta(minutes=5),
-}
-_PRELOAD = {
-    # yfinance only serves ~7 days of 1m bars (and 5m bars with a 60d period)
-    "1m": ("7d", "7d"),
-    "5m": ("60d", "60d"),
+    "1d": pd.Timedelta(days=1),
 }
 
-# Canonical lowercase column names we need, plus all the aliases yfinance has
-# used over the years (it always returned TitleCase prices; never lowercase).
-_COL_ALIASES = {
-    "open": "open",
-    "high": "high",
-    "low": "low",
-    "close": "close",
-    "volume": "volume",
-    # adjusted variants — never used by the engine, dropped
-    "adj open": None,
-    "adj high": None,
-    "adj low": None,
-    "adj close": None,
+# Yahoo's own history limits for intraday intervals. Asking for more than this
+# returns an empty frame, which used to look like "market closed".
+INTERVAL_PERIOD: dict[str, str] = {
+    "1m": "5d",
+    "2m": "5d",
+    "5m": "1mo",
+    "15m": "1mo",
+    "30m": "1mo",
+    "60m": "3mo",
+    "1h": "3mo",
+    "1d": "1y",
 }
+
+# Minimum bars the engine needs (pivLen*2+1 plus ATR warm-up) to be meaningful.
+MIN_BARS = 60
+
+
+class FeedError(RuntimeError):
+    pass
 
 
 class YFinanceFeed:
-    def __init__(
-        self,
-        symbol: str = "^NSEI",
-        tz: str = "Asia/Kolkata",
-        session_start: str = "09:15",
-        session_end: str = "15:30",
-        session_filter: bool = True,
-    ):
+    def __init__(self, symbol: str = "^NSEI", tz: str = "Asia/Kolkata",
+                 session_start: str = "09:15", session_end: str = "15:30",
+                 cache_ttl_sec: int = 15, max_retries: int = 3):
         self.symbol = symbol
         self.tzname = tz
         self.tz = ZoneInfo(tz)
-        self.session_start = dtime.fromisoformat(session_start)
-        self.session_end = dtime.fromisoformat(session_end)
-        self.session_filter = session_filter
+        self.session_start = session_start
+        self.session_end = session_end
+        self.cache_ttl_sec = max(0, int(cache_ttl_sec))
+        self.max_retries = max(1, int(max_retries))
+
+        self._lock = threading.Lock()
+        self._cache: dict[str, tuple[float, pd.DataFrame]] = {}
+        self._last_bar_ts: dict[str, pd.Timestamp] = {}
+        self._stale_since: dict[str, float] = {}
 
     # ------------------------------------------------------------------
-    def get_bars(self, tf: str) -> pd.DataFrame:
-        """Return an OHLC frame for ``tf`` (tz-aware IST index, session-filtered).
+    def get_bars(self, interval: str, lookback_period: str | None = None):
+        """Return a clean OHLCV DataFrame, or None if unavailable.
 
-        On any error (network, throttle, empty response) an **empty** DataFrame
-        is returned so the caller can simply skip this cycle.
+        Columns: open, high, low, close, volume. Index: tz-aware, sorted,
+        unique. Never raises.
         """
-        plan = _TF_PLAN.get(tf)
-        if plan is None:
-            log.warning("Unsupported timeframe %r — skipping", tf)
-            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        if interval not in INTERVAL_DELTA:
+            log.error("Unsupported interval %r — supported: %s",
+                      interval, ", ".join(sorted(INTERVAL_DELTA)))
+            return None
 
-        try:
-            import yfinance as yf
+        now = time.monotonic()
+        with self._lock:
+            hit = self._cache.get(interval)
+            if hit and (now - hit[0]) < self.cache_ttl_sec:
+                return hit[1]
 
-            raw = yf.download(
-                self.symbol,
-                interval=plan["interval"],
-                period=plan["period"],
-                auto_adjust=False,
-                progress=False,
-                threads=False,
-            )
-        except Exception:
-            log.exception("yfinance download failed for %s %s", self.symbol, tf)
-            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        period = lookback_period or INTERVAL_PERIOD.get(interval, "5d")
+        df = self._download(interval, period)
+        if df is None:
+            # Serve the last good frame rather than blinding the scanner.
+            with self._lock:
+                hit = self._cache.get(interval)
+            if hit is not None:
+                log.warning("[%s] using cached bars (age %.0fs) after download failure",
+                            interval, now - hit[0])
+                return hit[1]
+            return None
 
-        return self._normalize(raw)
+        self._check_staleness(interval, df)
+        with self._lock:
+            self._cache[interval] = (now, df)
+        return df
 
     # ------------------------------------------------------------------
-    def _normalize(self, raw: pd.DataFrame) -> pd.DataFrame:
-        cols = ["open", "high", "low", "close", "volume"]
+    def _download(self, interval: str, period: str):
+        last_exc: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                import yfinance as yf
+
+                raw = yf.download(
+                    tickers=self.symbol,
+                    period=period,
+                    interval=interval,
+                    auto_adjust=False,
+                    prepost=False,
+                    progress=False,
+                    threads=False,
+                )
+                df = self._normalise(raw)
+                if df is None or df.empty:
+                    raise FeedError(f"empty frame for {self.symbol} {interval}/{period}")
+                if len(df) < MIN_BARS:
+                    log.warning("[%s] only %d bars returned (need >= %d) — "
+                                "signals may warm up slowly", interval, len(df), MIN_BARS)
+                return df
+            except Exception as e:  # noqa: BLE001 — the loop must never die
+                last_exc = e
+                if attempt < self.max_retries:
+                    backoff = min(2 ** attempt, 8)
+                    log.warning("[%s] download attempt %d/%d failed (%s) — retrying in %ss",
+                                interval, attempt, self.max_retries, e, backoff)
+                    time.sleep(backoff)
+        log.error("[%s] all %d download attempts failed: %s",
+                  interval, self.max_retries, last_exc)
+        return None
+
+    # ------------------------------------------------------------------
+    def _normalise(self, raw):
         if raw is None or len(raw) == 0:
-            return pd.DataFrame(columns=cols)
+            return None
 
         df = raw.copy()
 
-        # yfinance may return MultiIndex columns (field, ticker) for a single
-        # symbol — flatten to the field level.
+        # yfinance >= 0.2.51 returns MultiIndex columns (field, ticker) even
+        # for a single ticker. Flatten to the field level.
         if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+            lvl0 = {str(c).lower() for c in df.columns.get_level_values(0)}
+            level = 0 if {"open", "high", "low", "close"} <= lvl0 else 1
+            df.columns = df.columns.get_level_values(level)
 
-        df.columns = [str(c).strip().lower() for c in df.columns]
-        # Deduplicate any repeated column labels (keep first occurrence).
-        df = df.loc[:, ~pd.Index(df.columns).duplicated()]
-
-        missing = [c for c in ("open", "high", "low", "close") if c not in df.columns]
+        df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+        required = ["open", "high", "low", "close"]
+        missing = [c for c in required if c not in df.columns]
         if missing:
-            log.error("yfinance frame missing columns %s (got %s)", missing, list(df.columns))
-            return pd.DataFrame(columns=cols)
+            raise FeedError(f"missing OHLC columns {missing}; got {list(df.columns)}")
 
-        if "volume" not in df.columns:
-            df["volume"] = 0.0
+        keep = required + (["volume"] if "volume" in df.columns else [])
+        df = df.loc[:, keep]
+        # A column can still be duplicated if Yahoo repeats a field.
+        df = df.loc[:, ~df.columns.duplicated()]
 
-        df = df[["open", "high", "low", "close", "volume"]]
-
-        # --- timezone: make the index tz-aware in the session timezone ---
-        idx = pd.DatetimeIndex(df.index)
-        if idx.tz is None:
-            # Yahoo intraday is normally tz-aware; if not, assume UTC then convert.
-            idx = idx.tz_localize("UTC")
-        idx = idx.tz_convert(self.tz)
+        # --- index: make it tz-aware in the exchange timezone ---
+        idx = pd.to_datetime(df.index, errors="coerce")
         df.index = idx
+        df = df[~df.index.isna()]
+        if getattr(df.index, "tz", None) is None:
+            # Naive timestamps from Yahoo intraday are UTC.
+            df.index = df.index.tz_localize("UTC")
+        df.index = df.index.tz_convert(self.tz)
 
-        # --- clean up ---
-        df = df.apply(pd.to_numeric, errors="coerce")
-        df = df.dropna(subset=["open", "high", "low", "close"])
-        df = df[~df.index.duplicated(keep="last")]
-        df = df.sort_index()
+        for c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-        # --- restrict to the NSE cash session so bars match TradingView ---
-        if self.session_filter and len(df) > 0:
-            wk = df.index.weekday < 5  # Mon–Fri
-            t = df.index.time
-            in_sess = (t >= self.session_start) & (t <= self.session_end)
-            df = df[wk & in_sess]
+        df = df.dropna(subset=required)
+        # Zero/negative prints are bad ticks, not bars.
+        df = df[(df[required] > 0).all(axis=1)]
+        # Impossible bars (high < low) are corrupt.
+        df = df[df["high"] >= df["low"]]
 
-        return df
-    def __init__(self, symbol: str = "^NSEI", tz: str = "Asia/Kolkata",
-                 session_start: str = "09:15", session_end: str = "15:30"):
-        self.symbol = symbol
-        self.tz = ZoneInfo(tz)
-        self.session_start = session_start
-        self.session_end = session_end
-        self._cache: dict[str, pd.DataFrame] = {}
-
-    # ------------------------------------------------------------------
-    def get_bars(self, tf: str) -> pd.DataFrame | None:
-        """Return cached+refreshed OHLC bars for `tf` (index tz-aware, tz=self.tz).
-
-        Always returns the FULL warm-up window — the engine needs the history
-        to converge its pool state (pivot confirmation needs 8 bars each side).
-        Lookback mode slices the *alerting* window in live.py, not here.
-        """
-        period, preload = _PRELOAD.get(tf, ("60d", "60d"))
-        df = self._refresh(tf, period, preload)
-        if df is None or df.empty:
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        if df.empty:
             return None
-        return self._session_filter(df)
+        return df
 
     # ------------------------------------------------------------------
-    def _refresh(self, tf: str, period: str, preload: str) -> pd.DataFrame | None:
-        cached = self._cache.get(tf)
-        if cached is None:
-            df = self._download(tf, period=preload)      # warm-up window
+    def _check_staleness(self, interval: str, df) -> None:
+        """Warn (loudly) if the newest bar stops advancing during the session."""
+        newest = df.index[-1]
+        prev = self._last_bar_ts.get(interval)
+        now = time.monotonic()
+        if prev is not None and newest == prev:
+            since = self._stale_since.setdefault(interval, now)
+            stalled = now - since
+            limit = INTERVAL_DELTA[interval].total_seconds() * 3
+            if stalled > limit and self._in_session():
+                log.warning("[%s] feed appears STALE: newest bar %s has not advanced "
+                            "for %.0fs during market hours", interval, newest, stalled)
         else:
-            last = cached.index.max()
-            if datetime.now(self.tz) - last > pd.Timedelta(minutes=7):
-                # re-download the whole window — yfinance may have revised bars
-                df = self._download(tf, period=period)
-            else:
-                # Incremental fetch: only the last ~10 minutes (yfinance needs a
-                # tz-aware datetime here, NOT a free-form string — its parser
-                # only accepts YYYY-MM-DD or datetime objects).
-                start = last - pd.Timedelta(minutes=10)
-                df = self._download(tf, start=start)
-                if df is not None and not df.empty:
-                    df = pd.concat([cached, df])
-        if df is None or df.empty:
-            # Fetch failed (e.g. Yahoo TLS handshake drop). Serve the last good
-            # bars instead of raising — the scanner must never crash on a
-            # transient network failure; it will simply emit no new signals.
-            if cached is not None and not cached.empty:
-                log.warning("yfinance unavailable (tf=%s) — serving %d cached bars",
-                            tf, len(cached))
-            return cached
-        df = self._normalize(df)
-        self._cache[tf] = df
-        return df
+            self._last_bar_ts[interval] = newest
+            self._stale_since.pop(interval, None)
 
-    def _download(self, tf: str, period: str | None = None,
-                  start: pd.Timestamp | datetime | None = None,
-                  retries: int = 5) -> pd.DataFrame | None:
-        """Download OHLCV bars from yfinance.
-
-        `period` (e.g. "7d"/"60d") is used for the warm-up fetch; `start` (a
-        tz-aware datetime) is used for the incremental fetch. NEVER pass a
-        free-form timestamp string to yfinance — yfinance 1.x only accepts
-        'YYYY-MM-DD' strings or datetime objects (see _parse_user_dt), and a
-        bad `start` silently makes the whole download return an empty frame.
-        """
-        yf = _import_yfinance()
-        last_err: Exception | None = None
-        for attempt in range(retries):
-            try:
-                if start is not None:
-                    if period is not None:
-                        # yfinance treats period as the window length measured
-                        # from `start`; the scanner wants "everything from start
-                        # to now", so drop period when start is given.
-                        period = None
-                    df = yf.download(
-                        self.symbol, interval=tf,
-                        start=start, progress=False, auto_adjust=False,
-                        threads=False,
-                    )
-                else:
-                    df = yf.download(
-                        self.symbol, interval=tf, period=period,
-                        progress=False, auto_adjust=False,
-                        threads=False,
-                    )
-                if df is not None and not df.empty:
-                    return df
-                last_err = RuntimeError("empty yfinance response")
-            except Exception as e:                      # noqa: BLE001
-                last_err = e
-            if attempt < retries - 1:
-                # exponential backoff (1s, 2s, 4s, 8s ...), capped at 30s —
-                # Yahoo's TLS drops are transient and usually clear on retry.
-                delay = min(2.0 ** attempt, 30.0)
-                log.debug("yfinance fetch failed (tf=%s, attempt %d/%d), "
-                          "retrying in %.0fs: %s",
-                          tf, attempt + 1, retries, delay, last_err)
-                time.sleep(delay)
-        if last_err is not None:
-            log.warning("yfinance fetch failed (tf=%s): %s", tf, last_err)
-        return None
-
-    @staticmethod
-    def _normalize(df: pd.DataFrame) -> pd.DataFrame:
-        """Normalize any yfinance OHLCV frame.
-
-        yfinance returns TitleCase columns
-        (Open/High/Low/Close/Adj Close/Volume) and, with its default
-        `multi_level_index=True`, wraps them in a (Price, Ticker) MultiIndex.
-        Older/other versions may return single-level or (Ticker, Price)
-        columns. This handles all of them and returns a frame with lowercase
-        open/high/low/close/volume on a tz-aware Asia/Kolkata index.
-        """
-        if df is None or df.empty:
-            return df
-
-        if isinstance(df.columns, pd.MultiIndex):
-            # pick the level that actually contains price names
-            wanted = {c for c, mapped in _COL_ALIASES.items() if mapped}
-            lvl = None
-            for i in range(df.columns.nlevels):
-                vals = {str(v).strip().lower() for v in df.columns.get_level_values(i)}
-                if vals & wanted:
-                    lvl = i
-                    break
-            if lvl is None:
-                lvl = 0
-            df = df.copy()
-            df.columns = df.columns.get_level_values(lvl)
-
-        df = df.copy()
-        df.columns = [str(c).strip().lower() for c in df.columns]
-
-        # keep only known price/volume aliases (drops Adj Close etc.),
-        # then map them to the canonical lowercase names
-        df = df[[c for c in df.columns if _COL_ALIASES.get(c) is not None]]
-        df = df.rename(columns={c: _COL_ALIASES[c] for c in df.columns})
-
-        missing = [c for c in ("open", "high", "low", "close", "volume")
-                   if c not in df.columns]
-        if missing:
-            raise ValueError(f"yfinance response missing columns {missing}")
-        df = df[["open", "high", "low", "close", "volume"]].copy()
-
-        df = df[~df.index.duplicated(keep="last")]
-        df = df.sort_index()
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("Asia/Kolkata")
-        else:
-            df.index = df.index.tz_convert("Asia/Kolkata")
-        return df
-
-    def _session_filter(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Keep only bars whose timestamp falls inside the NSE session.
-
-        NSE session 09:15-15:30 IST: a 5m bar starting at 15:25 ends at 15:30 and is the last valid bar.
-        A bar starting at 15:30 itself is outside session (it would end at 15:35).
-        So we filter on start time: session_start <= time < session_end.
-        This matches TradingView's session filter for NSE.
-        """
-        s_h, s_m = map(int, self.session_start.split(":"))
-        e_h, e_m = map(int, self.session_end.split(":"))
-        s_t = dtime(s_h, s_m)
-        e_t = dtime(e_h, e_m)
-
-        def _inside(ts):
-            t = ts.time()
-            return s_t <= t < e_t
-
-        mask = df.index.to_series().apply(_inside)
-        return df[mask]
+    def _in_session(self) -> bool:
+        from datetime import datetime, time as dtime
+        now = datetime.now(self.tz)
+        if now.weekday() >= 5:
+            return False
+        try:
+            start = dtime.fromisoformat(self.session_start)
+            end = dtime.fromisoformat(self.session_end)
+        except ValueError:
+            return True
+        return start <= now.time() <= end

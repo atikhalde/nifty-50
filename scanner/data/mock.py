@@ -1,19 +1,8 @@
-"""Synthetic data feed for offline preview / demo (no network, no Telegram).
+"""Deterministic synthetic feed — lets you exercise the full alert path offline.
 
-``make_mock_bars()`` builds a deterministic OHLC frame (tz-aware IST index,
-lowercase columns) engineered to contain clear swing highs/lows — so the
-BSL/SSL engine produces BUY, SELL and sweep signals you can preview with::
-
-    python run_scanner.py --dump-sample
-    python run_scanner.py --mock
-
-``MockFeed`` replays that frame incrementally so ``run_scanner.py --mock``
-behaves like a live stream: each ``get_bars`` call reveals one more closed bar.
-"""Synthetic OHLC feed for offline previews and self-tests.
-
-Generates deterministic NIFTY-like 1m/5m bars (seeded RNG) with a gentle
-trend + volatility waves, plus a few sharp swing spikes so the BSL/SSL engine
-produces real pools, sweeps and signals without any network access.
+`make_mock_bars()` builds a NIFTY-like 5-minute series with engineered swing
+highs/lows and sweeps so BUY, SELL and 🧹 sweep alerts are all guaranteed to
+appear. `MockFeed` replays it bar by bar so `--mock` behaves like a live feed.
 """
 
 from __future__ import annotations
@@ -21,187 +10,90 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-_TZ = "Asia/Kolkata"
+from scanner.data.yfinance_feed import INTERVAL_DELTA  # noqa: F401  (re-export parity)
 
-# columns produced, matching the yfinance feed contract
-_COLS = ["open", "high", "low", "close", "volume"]
+TZ = "Asia/Kolkata"
 
 
-def make_mock_bars(n: int = 260, base: float = 24_000.0, seed: int = 7) -> pd.DataFrame:
-    """Deterministic synthetic NIFTY-like 5m frame with engineered swings.
-
-    Bars are placed on a continuous 5-minute grid inside the NSE session
-    (09:15–15:30 IST) across consecutive weekdays, so they survive the feed's
-    session filter and line up like real intraday bars.
-    """
+def make_mock_bars(n: int = 400, seed: int = 7, start_price: float = 24_300.0):
+    """Random-walk OHLC with injected swings and sweeps (deterministic)."""
     rng = np.random.default_rng(seed)
 
-    # --- a gentle random walk as the baseline close ---
-    steps = rng.normal(0.0, 8.0, size=n)
-    close = base + np.cumsum(steps)
+    # Session-shaped index: 5-minute bars starting at an NSE open.
+    idx = pd.date_range("2026-08-03 09:15", periods=n, freq="5min", tz=TZ)
 
+    steps = rng.normal(0.0, 12.0, n).cumsum()
+    close = start_price + steps
     open_ = np.empty(n)
-    high = np.empty(n)
-    low = np.empty(n)
-    open_[0] = close[0]
-    for i in range(1, n):
-        open_[i] = close[i - 1]
+    open_[0] = start_price
+    open_[1:] = close[:-1]
 
-    # base high/low around the open/close with a little noise
-    for i in range(n):
-        hi = max(open_[i], close[i]) + abs(rng.normal(0, 4.0)) + 3.0
-        lo = min(open_[i], close[i]) - abs(rng.normal(0, 4.0)) - 3.0
-        high[i] = hi
-        low[i] = lo
+    spread = np.abs(rng.normal(0.0, 9.0, n)) + 3.0
+    high = np.maximum(open_, close) + spread
+    low = np.minimum(open_, close) - spread
 
-    # --- engineer distinct swing highs (→ BSL pools → SELL signals) ---
-    for i in (30, 70, 150):
+    # --- engineered swing highs (open BSL pools -> SELL under fade mapping) ---
+    for i in (40, 110, 190, 275, 340):
         if i < n:
-            high[i] = max(high[i], close[i - 1] + 90.0)
-            # keep it a strict local extreme
-            for k in range(1, 9):
-                if i - k >= 0:
-                    high[i - k] = min(high[i - k], high[i] - 20.0)
-                if i + k < n:
-                    high[i + k] = min(high[i + k], high[i] - 20.0)
+            high[i] = max(high[i], np.max(high[max(0, i - 12):i + 13]) + 60.0)
 
-    # --- engineer distinct swing lows (→ SSL pools → BUY signals) ---
-    for i in (50, 110, 190):
+    # --- engineered swing lows (open SSL pools -> BUY) ---
+    for i in (70, 145, 225, 305):
         if i < n:
-            low[i] = min(low[i], close[i - 1] - 90.0)
-            for k in range(1, 9):
-                if i - k >= 0:
-                    low[i - k] = max(low[i - k], low[i] + 20.0)
-                if i + k < n:
-                    low[i + k] = max(low[i + k], low[i] + 20.0)
+            low[i] = min(low[i], np.min(low[max(0, i - 12):i + 13]) - 60.0)
 
-    # --- engineer a couple of sweeps (trade through a prior level, close back) ---
-    # sweep the BSL pool created from the swing high at bar 30 (~confirmed @38)
-    if 95 < n:
-        lvl = high[30]
-        high[95] = lvl + 25.0
-        close[95] = lvl - 15.0
-        open_[95] = lvl - 5.0
-        low[95] = min(low[95], close[95] - 10.0)
-    # sweep the SSL pool created from the swing low at bar 50 (~confirmed @58)
-    if 130 < n:
-        lvl = low[50]
-        low[130] = lvl - 25.0
-        close[130] = lvl + 15.0
-        open_[130] = lvl + 5.0
-        high[130] = max(high[130], close[130] + 10.0)
+    # --- engineered sweeps: pierce a prior swing level, close back inside ---
+    for src, hit in ((40, 62), (110, 132), (70, 96), (145, 170)):
+        if hit >= n or src >= n:
+            continue
+        if src in (40, 110):                      # BSL sweep: high > lvl, close < lvl
+            lvl = high[src]
+            high[hit] = lvl + 25.0
+            close[hit] = lvl - 30.0
+            open_[hit] = lvl - 10.0
+            low[hit] = min(low[hit], close[hit] - 15.0)
+        else:                                      # SSL sweep: low < lvl, close > lvl
+            lvl = low[src]
+            low[hit] = lvl - 25.0
+            close[hit] = lvl + 30.0
+            open_[hit] = lvl + 10.0
+            high[hit] = max(high[hit], close[hit] + 15.0)
 
-    # --- fix any invariant violations (high must be the max, low the min) ---
-    for i in range(n):
-        high[i] = max(high[i], open_[i], close[i], low[i])
-        low[i] = min(low[i], open_[i], close[i], high[i])
+    # Enforce OHLC integrity after the injections.
+    high = np.maximum.reduce([high, open_, close])
+    low = np.minimum.reduce([low, open_, close])
 
-    idx = _session_index(n)
-    df = pd.DataFrame(
+    return pd.DataFrame(
         {
             "open": open_,
             "high": high,
             "low": low,
             "close": close,
-            "volume": rng.integers(1_000, 50_000, size=n).astype(float),
+            "volume": rng.integers(50_000, 250_000, n).astype(float),
         },
         index=idx,
     )
-    return df
-
-
-def _session_index(n: int) -> pd.DatetimeIndex:
-    """Build ``n`` consecutive 5-minute timestamps inside the NSE session,
-    rolling over to the next weekday when a day's session is exhausted."""
-    # 09:15 -> 15:30 inclusive at 5m = 76 bars per day
-    per_day = 76
-    stamps: list[pd.Timestamp] = []
-    day = pd.Timestamp("2026-08-03 09:15", tz=_TZ)  # a Monday
-    while len(stamps) < n:
-        if day.weekday() < 5:
-            start = day.normalize() + pd.Timedelta(hours=9, minutes=15)
-            for k in range(per_day):
-                if len(stamps) >= n:
-                    break
-                stamps.append(start + k * pd.Timedelta(minutes=5))
-        day = day + pd.Timedelta(days=1)
-    return pd.DatetimeIndex(stamps)
 
 
 class MockFeed:
-    """Replays a synthetic frame incrementally to emulate a live stream."""
+    """Replays synthetic bars, revealing one more bar on each `get_bars` call."""
 
-    def __init__(self, df: pd.DataFrame | None = None, start_at: int = 60):
-        self._df = df if df is not None else make_mock_bars()
-        # reveal a warm-up chunk first, then one more bar per get_bars call
-        self._cursor = min(max(start_at, 2), len(self._df))
+    def __init__(self, bars=None, warmup: int = 120, step: int = 1):
+        self._bars = bars if bars is not None else make_mock_bars()
+        self._warmup = max(2, int(warmup))
+        self._step = max(1, int(step))
+        self._cursor: dict[str, int] = {}
 
-    def get_bars(self, tf: str) -> pd.DataFrame:
-        # timeframe is ignored for the mock — same synthetic series for all tf
-        window = self._df.iloc[: self._cursor].copy()
-        if self._cursor < len(self._df):
-            self._cursor += 1
-        return window
-import math
+    def get_bars(self, interval: str, lookback_period: str | None = None):
+        n = len(self._bars)
+        cur = self._cursor.get(interval, self._warmup)
+        cur = min(cur, n)
+        df = self._bars.iloc[:cur].copy()
+        self._cursor[interval] = min(cur + self._step, n)
 
-import numpy as np
-import pandas as pd
-
-# NIFTY-ish starting level so messages look realistic
-BASE = 24300.0
-RNG_SEED = 7
-
-INTERVAL_DELTA = {
-    "1m": pd.Timedelta(minutes=1),
-    "5m": pd.Timedelta(minutes=5),
-}
-
-
-def make_mock_bars(n: int = 300, tf: str = "5m") -> pd.DataFrame:
-    """Deterministic synthetic OHLC bars, tz-aware Asia/Kolkata index.
-
-    Sine + drift price path with a few engineered swing spikes (high above the
-    path, low below it) so pivot-based pools reliably form.
-    """
-    rng = np.random.default_rng(RNG_SEED)
-    freq = {"1m": "1min", "5m": "5min"}.get(tf, "5min")  # pandas>=2.2 alias
-    idx = pd.date_range("2026-08-31 09:15", periods=n, freq=freq,
-                        tz="Asia/Kolkata")
-    t = np.arange(n)
-    path = BASE + 60 * np.sin(t / 25.0) + t * 0.5 + rng.normal(0, 12, n).cumsum() * 0.3
-    amp = 25 + 8 * np.abs(np.sin(t / 40.0))
-
-    open_ = np.roll(path, 1)
-    open_[0] = path[0]
-    close = path
-    high = np.maximum(open_, close) + amp
-    low = np.minimum(open_, close) - amp
-
-    # engineered swing spikes -> guaranteed pools/sweeps for previews
-    high[40] += 130.0
-    low[70] -= 130.0
-    high[120] += 90.0
-    low[160] -= 90.0
-
-    df = pd.DataFrame({
-        "open": open_, "high": high, "low": low, "close": close,
-        "volume": rng.integers(50_000, 200_000, n),
-    }, index=idx)
-    return df.round(2)
-
-
-class MockFeed:
-    """Drop-in replacement for YFinanceFeed (same get_bars contract)."""
-
-    def __init__(self, symbol: str = "^NSEI", tz: str = "Asia/Kolkata",
-                 session_start: str = "09:15", session_end: str = "15:30"):
-        self.symbol = symbol
-        self.tz = tz
-        self._cache: dict[str, pd.DataFrame] = {}
-
-    def get_bars(self, tf: str) -> pd.DataFrame | None:
-        df = self._cache.get(tf)
-        if df is None:
-            df = make_mock_bars(tf=tf)
-            self._cache[tf] = df
+        # Re-stamp so the newest bars look "just closed" relative to now, which
+        # is what the live scanner's closed-bar filter expects.
+        delta = INTERVAL_DELTA.get(interval, pd.Timedelta(minutes=5))
+        end = pd.Timestamp.now(tz=TZ).floor(delta)
+        df.index = pd.date_range(end=end, periods=len(df), freq=delta, tz=TZ)
         return df

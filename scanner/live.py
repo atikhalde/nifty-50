@@ -65,11 +65,16 @@ def _fmt_inr(v: float | None) -> str:
 
 
 class LiveScanner:
-    def __init__(self, cfg, params: BSLSSLParams | None = None, feed=None,
-                 lookback_minutes: int = 0, market_check: bool = True):
+    # Never fire more than this many historical bars in one cycle.
+    MAX_BACKLOG_BARS = 5
+
+    def __init__(self, cfg, params: BSLSSLParams | None = None, feed=None):
         self.cfg = cfg
         self.params = params or BSLSSLParams.from_env()
         self.tz = ZoneInfo(cfg.tz)
+        # Parse the session window once; a bad value must not break every tick.
+        self._session_start = self._parse_time(cfg.session_start, dtime(9, 15))
+        self._session_end = self._parse_time(cfg.session_end, dtime(15, 30))
         self.feed = feed or YFinanceFeed(
             symbol=cfg.symbol, tz=cfg.tz,
             session_start=cfg.session_start, session_end=cfg.session_end,
@@ -92,6 +97,14 @@ class LiveScanner:
         # of looking healthy (the old behaviour: exceptions swallowed quietly).
         self._tf_failures: dict[str, int] = {}
 
+    @staticmethod
+    def _parse_time(value: str, fallback: dtime) -> dtime:
+        try:
+            return dtime.fromisoformat(str(value).strip())
+        except (ValueError, TypeError):
+            log.warning("Invalid session time %r — using %s", value, fallback)
+            return fallback
+
     # ------------------------------------------------------------------
     # main loop
     # ------------------------------------------------------------------
@@ -102,15 +115,29 @@ class LiveScanner:
                  self.params.fast_piv_len, self.params.sig_dir)
         if not self.notifier.enabled:
             log.info("Telegram is DISABLED — alerts will only be logged (dry-run).")
+        for problem in getattr(self.cfg, "validate", lambda: [])():
+            log.warning("config: %s", problem)
+
+        consecutive_failures = 0
         try:
             while True:
+                started = time.monotonic()
                 try:
                     self.tick()
+                    consecutive_failures = 0
                 except Exception:
-                    log.exception("scan cycle failed")
-                time.sleep(self.cfg.scan_interval_sec)
+                    consecutive_failures += 1
+                    log.exception("scan cycle failed (%d in a row)", consecutive_failures)
+                    if consecutive_failures in (5, 25, 100):
+                        log.error("scanner has failed %d consecutive cycles — "
+                                  "check network/feed/credentials", consecutive_failures)
+                # Drift-corrected sleep: a slow cycle must not push the next
+                # scan past the close of the following bar.
+                elapsed = time.monotonic() - started
+                time.sleep(max(1.0, self.cfg.scan_interval_sec - elapsed))
         except KeyboardInterrupt:
             log.info("Shutting down…")
+        finally:
             self.state.persist()
 
     def tick(self) -> None:
@@ -146,7 +173,19 @@ class LiveScanner:
         if now.weekday() >= 5:
             return False
         t = now.time()
-        return dtime.fromisoformat(self.cfg.session_start) <= t <= dtime.fromisoformat(self.cfg.session_end)
+        return self._session_start <= t <= self._session_end
+
+    # ------------------------------------------------------------------
+    def _to_local_ts(self, value):
+        """Parse a stored/observed timestamp into a tz-aware local Timestamp.
+
+        State written by an older build (or edited by hand) can be tz-naive;
+        `tz_convert` would raise on it and kill the scan cycle.
+        """
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None or ts.tz is None:
+            return ts.tz_localize(self.tz)
+        return ts.tz_convert(self.tz)
 
     # ------------------------------------------------------------------
     def _retry_pending(self, now) -> None:
@@ -206,26 +245,40 @@ class LiveScanner:
                 log.info("[%s] baseline set at %s (skipping history)", tf, closed[-1])
                 return
 
-            threshold = pd.Timestamp(last_ev).tz_convert(self.tz)
-            new_bars = closed[closed > threshold]
-            if len(new_bars) == 0:
-                return
+        try:
+            threshold = self._to_local_ts(last_ev)
+        except Exception:
+            log.exception("[%s] unreadable last_evaluated %r — re-baselining", tf, last_ev)
+            self.state.set_last_evaluated(tf, closed[-1].isoformat())
+            self.state.persist()
+            return
 
-        # Never alert stale bars (e.g. after a restart with an old state file
-        # or a long data outage): a signal from 30 minutes ago is not tradable.
-        max_age = pd.Timedelta(minutes=getattr(self.cfg, "max_alert_age_min", 10))
-        cutoff = pd.Timestamp(now) - max_age
-        stale = [ts for ts in new_bars if (ts + delta) < cutoff]
-        fresh = [ts for ts in new_bars if (ts + delta) >= cutoff]
-        if stale:
-            log.warning("[%s] skipping %d stale bar(s) older than %s min (restart/outage catch-up)",
-                        tf, len(stale), getattr(self.cfg, "max_alert_age_min", 10))
+        new_bars = closed[closed > threshold]
+        if len(new_bars) == 0:
+            return
+
+        # A feed hiccup (or a very long outage) can hand us a large backlog.
+        # Alerting on stale bars is worse than skipping them in a live market.
+        max_backlog = self.MAX_BACKLOG_BARS
+        if len(new_bars) > max_backlog:
+            log.warning("[%s] %d new closed bars (feed gap?) — only alerting the newest %d",
+                        tf, len(new_bars), max_backlog)
+            new_bars = new_bars[-max_backlog:]
 
         changed = False
-        for ts in fresh:
-            row = sig.loc[ts]
-            bar = df.loc[ts]
-            changed |= self._emit_bar(tf, ts, row, bar, df)
+        for ts in new_bars:
+            try:
+                row = sig.loc[ts]
+                bar = df.loc[ts]
+                # Defensive: a duplicated index would make .loc return a frame.
+                if isinstance(row, pd.DataFrame):
+                    row = row.iloc[-1]
+                if isinstance(bar, pd.DataFrame):
+                    bar = bar.iloc[-1]
+            except KeyError:
+                log.warning("[%s] bar %s vanished from the frame — skipping", tf, ts)
+                continue
+            changed |= self._emit_bar(tf, ts, row, bar)
 
     # ------------------------------------------------------------------
 

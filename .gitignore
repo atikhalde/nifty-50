@@ -6,7 +6,8 @@
 __pycache__/
 *.pyc
 
-# runtime artifacts (repo-root only — NOT the scanner/data source package)
-# runtime artifacts (repo root only — do NOT ignore scanner/data/ package)
+# runtime artifacts (anchored to the repo root so they do NOT match
+# source packages like scanner/data/ — an unanchored "data/" silently
+# excluded the entire market-data package from the first commit)
 /logs/
 /data/

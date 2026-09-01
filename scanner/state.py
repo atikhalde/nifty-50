@@ -14,6 +14,11 @@ log = logging.getLogger(__name__)
 
 
 class SentState:
+    # A full trading day emits far fewer than this; the cap only guards
+    # against unbounded growth over months of continuous running.
+    MAX_KEYS = 20_000
+    PRUNE_SLACK = 2_000
+
     def __init__(self, path: str):
         self.path = path
         self.sent: dict[str, bool] = {}
@@ -41,14 +46,21 @@ class SentState:
 
     def mark(self, key: str) -> None:
         self.sent[key] = True
-        self.pending.pop(key, None)
+        self._prune()
 
-    def add_pending(self, key: str, text: str, queued_iso: str) -> None:
-        if key not in self.sent and key not in self.pending:
-            self.pending[key] = {"text": text, "queued": queued_iso}
+    def _prune(self) -> None:
+        """Keep the dedupe ledger bounded.
 
-    def drop_pending(self, key: str) -> None:
-        self.pending.pop(key, None)
+        Keys are appended in chronological order, so dropping the oldest
+        entries is safe: those bars can never be re-emitted anyway because
+        `last_evaluated` has long since moved past them.
+        """
+        overflow = len(self.sent) - self.MAX_KEYS
+        if overflow <= 0:
+            return
+        for key in list(self.sent)[:overflow + self.PRUNE_SLACK]:
+            self.sent.pop(key, None)
+        log.info("Pruned dedupe ledger to %d keys", len(self.sent))
 
     def set_last_evaluated(self, tf: str, ts_iso: str) -> None:
         self.last_evaluated[tf] = ts_iso
