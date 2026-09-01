@@ -176,13 +176,13 @@ def test_signal_message_pool_mapping():
         sig = compute_signals(df, p)
         sc = _scanner_for(p, state)
 
-        msg = sc._build_signal_msg("SELL", "5m", df.index[28], sig.iloc[28], df.iloc[28])
+        msg = sc._build_signal_msg("SELL", "5m", df.index[28], sig.iloc[28], df.iloc[28], None)
         assert "BSL-01" in msg, f"default SELL must name the fresh BSL pool:\n{msg}"
         assert "@ 120.00" in msg, msg
         assert "actual HIGH" in msg, msg
         assert sc._level_of("SELL", sig.iloc[28]) == 120.0
 
-        msg = sc._build_signal_msg("BUY", "5m", df.index[33], sig.iloc[33], df.iloc[33])
+        msg = sc._build_signal_msg("BUY", "5m", df.index[33], sig.iloc[33], df.iloc[33], None)
         assert "SSL-01" in msg, f"default BUY must name the fresh SSL pool:\n{msg}"
         assert "@ 70.00" in msg, msg
         assert "actual LOW" in msg, msg
@@ -193,14 +193,14 @@ def test_signal_message_pool_mapping():
         sigm = compute_signals(df, pm)
         scm = _scanner_for(pm, state)
 
-        msg = scm._build_signal_msg("BUY", "5m", df.index[28], sigm.iloc[28], df.iloc[28])
+        msg = scm._build_signal_msg("BUY", "5m", df.index[28], sigm.iloc[28], df.iloc[28], None)
         assert "BSL-01" in msg, f"magnet BUY must name the fresh BSL pool:\n{msg}"
         assert "@ 120.00" in msg, msg
         assert "actual HIGH" in msg, msg
         assert "pool start @ —" not in msg, "magnet BUY lost its pool level"
         assert scm._level_of("BUY", sigm.iloc[28]) == 120.0, "magnet BUY dedupe level"
 
-        msg = scm._build_signal_msg("SELL", "5m", df.index[33], sigm.iloc[33], df.iloc[33])
+        msg = scm._build_signal_msg("SELL", "5m", df.index[33], sigm.iloc[33], df.iloc[33], None)
         assert "SSL-01" in msg, f"magnet SELL must name the fresh SSL pool:\n{msg}"
         assert "@ 70.00" in msg, msg
         assert "actual LOW" in msg, msg
