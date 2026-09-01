@@ -185,6 +185,26 @@ class YFinanceFeed:
         return df
 
     def _session_filter(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Keep only bars whose timestamp falls inside the NSE session.
+
+        NSE session 09:15-15:30 IST: a 5m bar starting at 15:25 ends at 15:30 and is the last valid bar.
+        A bar starting at 15:30 itself is outside session (it would end at 15:35).
+        So we filter on start time: session_start <= time < session_end, plus allow exactly session_start.
+        This matches TradingView's session filter for NSE.
+        """
+        from datetime import time as dtime
+        s_h, s_m = map(int, self.session_start.split(":"))
+        e_h, e_m = map(int, self.session_end.split(":"))
+        s_t = dtime(s_h, s_m)
+        e_t = dtime(e_h, e_m)
+
+        def _inside(ts):
+            t = ts.time()
+            # For IST, compare time only; date already filtered by yfinance period
+            # Include bars starting at session_start, exclude bars starting at or after session_end
+            return s_t <= t < e_t
+
+        mask = df.index.to_series().apply(_inside)
         """Keep only bars whose timestamp falls inside the NSE session."""
         s, e = self.session_start, self.session_end
         mask = df.index.to_series().apply(

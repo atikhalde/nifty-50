@@ -89,15 +89,21 @@ def main() -> int:
         print("=" * 60)
         for ts, row in list(rows.iterrows())[-6:]:
             bar = df.loc[ts]
+            # actual swing = confirmation - piv_len (for sample, compute from index)
+            try:
+                pos = df.index.get_loc(ts)
+                actual_ts = df.index[pos - params.piv_len] if pos >= params.piv_len else None
+            except Exception:
+                actual_ts = None
             msgs = []
             if bool(row["buy_sig"]):
-                msgs.append(scanner._build_signal_msg("BUY", "5m", ts, row, bar))
+                msgs.append(scanner._build_signal_msg("BUY", "5m", ts, row, bar, actual_ts))
             if bool(row["sell_sig"]):
-                msgs.append(scanner._build_signal_msg("SELL", "5m", ts, row, bar))
+                msgs.append(scanner._build_signal_msg("SELL", "5m", ts, row, bar, actual_ts))
             if bool(row["swept_ssl"]):
-                msgs.append(scanner._build_sweep_msg("SSL", "5m", ts, row))
+                msgs.append(scanner._build_sweep_msg("SSL", "5m", ts, row, bar))
             if bool(row["swept_bsl"]):
-                msgs.append(scanner._build_sweep_msg("BSL", "5m", ts, row))
+                msgs.append(scanner._build_sweep_msg("BSL", "5m", ts, row, bar))
             print("\n" + "-" * 60)
             for m in msgs:
                 print(m)
