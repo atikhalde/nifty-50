@@ -137,6 +137,13 @@ class ScannerConfig:
     session_end: str = field(default_factory=lambda: _env_time("SESSION_END", "15:30"))
     tz: str = field(default_factory=_env_tz)
 
+    # --- lookback mode (GitHub Actions / cloud) ---
+    # Each Actions run is a fresh machine: scan the last N minutes of closed
+    # bars every run instead of waiting for new bars. Dedupe still comes from
+    # the cached data/sent_alerts.json, so no alert is ever repeated.
+    # 0 = disabled (live incremental mode).
+    lookback_minutes: int = int(os.getenv("LOOKBACK_MINUTES", "0") or 0)
+
     # --- telegram (both bots receive the SAME alerts) ---
     telegram_enabled: bool = field(default_factory=lambda: _env_bool("TELEGRAM_ENABLED", True))
     bot1_token: str = field(default_factory=lambda: _env_str("BOT1_TOKEN", ""))

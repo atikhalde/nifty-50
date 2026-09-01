@@ -23,6 +23,9 @@ class SentState:
         self.path = path
         self.sent: dict[str, bool] = {}
         self.last_evaluated: dict[str, str] = {}
+        # alerts that failed delivery and must be retried:
+        #   key -> {"text": str, "queued": iso-timestamp}
+        self.pending: dict[str, dict] = {}
         self._load()
 
     # ------------------------------------------------------------------
@@ -32,6 +35,7 @@ class SentState:
                 d = json.load(f)
             self.sent = d.get("sent", {})
             self.last_evaluated = d.get("last_evaluated", {})
+            self.pending = d.get("pending", {})
         except FileNotFoundError:
             pass
         except Exception:
@@ -66,7 +70,8 @@ class SentState:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"sent": self.sent, "last_evaluated": self.last_evaluated},
+                json.dump({"sent": self.sent, "last_evaluated": self.last_evaluated,
+                           "pending": self.pending},
                           f, indent=2)
             os.replace(tmp, self.path)
         except Exception:
