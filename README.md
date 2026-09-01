@@ -75,6 +75,52 @@ The scanner:
 - runs only during NSE hours `09:15–15:30 IST`, Mon–Fri
   (`MARKET_HOURS_ONLY=false` to disable).
 
+### 5. Cloud scanning (GitHub Actions) — optional, no server needed
+
+`.github/workflows/scanner.yml` runs the scanner on GitHub's cloud, so the
+**5m signals reach you even when your machine is off**. It runs **every
+5 minutes, Mon–Fri, during NSE hours (09:15–15:30 IST)** and can also be
+triggered manually (Actions tab → *NIFTY BSL/SSL Scanner* → **Run workflow**).
+
+Setup:
+1. Push this repo to GitHub and merge to `main`
+   (**scheduled workflows only run from the default branch**).
+2. Add **repository secrets** — *Settings → Secrets and variables → Actions*:
+
+   | Secret | Meaning |
+   |---|---|
+   | `BOT1_TOKEN` | Telegram bot 1 token (from @BotFather) |
+   | `BOT2_TOKEN` | Telegram bot 2 token |
+   | `CHAT_ID` | chat/group/channel ID for bot 1 (and bot 2) |
+   | `CHAT_ID_2` | optional — separate chat for bot 2 (defaults to `CHAT_ID`) |
+
+   The names must match exactly — the workflow reads them by these names.
+3. Done. Watch runs in the **Actions** tab; the first one appears within
+   5 minutes during market hours.
+
+How it works — **lookback mode** (`LOOKBACK_MINUTES=20`):
+- Every Actions run is a **fresh machine**, so it cannot wait for new bars
+  like the local scanner. Instead each run:
+  1. restores `data/sent_alerts.json` from the **Actions cache**;
+  2. downloads the full warm-up window (60 days of 5m bars) so the engine's
+     pool state converges exactly like a live scanner;
+  3. evaluates the BSL/SSL engine over all history, but **alerts only on
+     closed bars inside the last 20 minutes**;
+  4. saves the updated dedupe state back to the cache.
+- Because every alert key is persisted in the cached state file, **no alert
+  can ever be sent twice**, no matter how many fresh runs replay the same
+  bars. Old keys are trimmed weekly-style by `scanner/prune_state.py` to keep
+  the cache small.
+
+> 📌 The cloud workflow is **5m-only** (GitHub's minimum schedule is 5
+> minutes). Your **1m signals** still come from the local run
+> (`python run_scanner.py` with `.env`) — both can run side by side with the
+> same bots, and the shared no-duplicate guarantee still holds per run type.
+>
+> ⚠️ **yfinance** is free and unofficial; Yahoo can throttle — if you see
+> repeated fetch errors, raise `SCAN_INTERVAL_SEC` (local) or accept that a
+> throttled cloud run simply skips until the next 5-minute slot.
+
 ---
 
 ## 📱 Alert formats
@@ -115,6 +161,7 @@ even across scanner restarts. Failed deliveries are retried until delivered.
 | `SCAN_INTERVAL_SEC` | `20` | scan cadence |
 | `MARKET_HOURS_ONLY` | `true` | scan only 09:15–15:30 IST Mon–Fri |
 | `SESSION_START/END` | `09:15` / `15:30` | NSE session |
+| `LOOKBACK_MINUTES` | `0` | cloud lookback: scan the last N minutes of closed bars and exit (0 = live mode; the Actions workflow sets `20`) |
 | `SWEEP_ALERTS` | `true` | send separate 🧹 sweep alerts |
 | `PIV_LEN` | `8` | swing pivot strength (bars each side) |
 | `ATR_LEN` | `14` | ATR period |
@@ -138,14 +185,35 @@ abcd.txt                        # the original Pine Script (reference)
 run_scanner.py                  # entry point
 config.py                       # env-based configuration
 selftest.py                     # offline engine parity tests
+.github/workflows/scanner.yml   # cloud scanner (5m, Mon-Fri, NSE hours)
 scanner/
   indicators/bsl_ssl.py         # 1:1 Python port of the indicator
   data/yfinance_feed.py         # yfinance feed (warm-up + incremental)
   data/mock.py                  # synthetic data for offline preview
   alerts/telegram.py            # dual-bot notifier
-  live.py                       # scan loop, dedupe, message building
+  live.py                       # scan loop, lookback, dedupe, message building
   state.py                      # persistent no-repeat dedupe
+  prune_state.py                # trims old dedupe keys (cache hygiene)
 ```
+
+---
+
+## 🔧 Troubleshooting
+
+- **Actions run is green but no Telegram alert arrives**: check the run log
+  for `timeframe 5m failed` / `yfinance fetch failed`. yfinance is unofficial
+  and can be throttled — the run skips to the next 5-minute slot by design.
+  Also confirm the four secrets (`BOT1_TOKEN`, `BOT2_TOKEN`, `CHAT_ID`,
+  `CHAT_ID_2`) are set; if they are missing, alerts are only logged and are
+  **not** marked as sent, so they will be delivered once the secrets are added.
+- **Local scanner downloads bars once and then never sends again**: make sure
+  the yfinance feed can refresh (check `logs/scanner.log` for fetch errors).
+  The feed normalizes any yfinance column layout (TitleCase / MultiIndex
+  `(Price, Ticker)`) and passes a datetime — not a string — to the incremental
+  fetch, which yfinance 1.x requires.
+- **Sanity-check the feed without Telegram**:
+  `TELEGRAM_ENABLED=false python run_scanner.py --once` — signals that occur
+  are printed as dry-run alerts.
 
 ---
 
