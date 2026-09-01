@@ -124,6 +124,16 @@ even across scanner restarts. Failed deliveries are retried until delivered.
 | `POOL_EXPIRY` | `300` | pool expiry in bars |
 | `SIG_DIR` | `BSL→SELL · SSL→BUY` | or `BSL→BUY · SSL→SELL` (magnet) |
 | `ATR_SL` / `RR_TARGET` | `1.2` / `2.0` | SL and TP multiples |
+| `SCANNER_TZ` | `Asia/Kolkata` | exchange timezone — **overrides `TZ`** |
+
+> ⏰ **Timezone gotcha.** Many Docker images and CI runners export `TZ=UTC`,
+> which would shift the whole 09:15–15:30 session window by 5h30m and make the
+> scanner think the market is closed all day. Prefer `SCANNER_TZ=Asia/Kolkata`;
+> it always wins over `TZ`. The scanner warns at startup if the two disagree.
+
+Every value is parsed defensively: a typo (`SCAN_INTERVAL_SEC=abc`, an
+unsupported timeframe, `9:15` instead of `09:15`) logs a warning and falls back
+to the documented default instead of crashing during market hours.
 
 > ⚠️ **Settings must match your TradingView chart.** If you changed any input
 > in the indicator's settings panel, set the same value in `.env` — otherwise
@@ -146,6 +156,36 @@ scanner/
   live.py                       # scan loop, dedupe, message building
   state.py                      # persistent no-repeat dedupe
 ```
+
+---
+
+## ✅ Pre-market checklist
+
+Run this a few minutes before 09:15 IST — it catches every failure mode that
+would otherwise surface as a missed signal:
+
+```bash
+python selftest.py                 # 12 checks: engine parity + live hardening
+python run_scanner.py --once       # verifies feed + Telegram tokens, sets baseline
+tail -f logs/scanner.log
+```
+
+`--once` pings Telegram's `getMe` for both bots, so a bad token or wrong
+`CHAT_ID` is reported immediately instead of at the first live signal.
+
+### How the scanner behaves when things go wrong
+
+| Failure | Behaviour |
+|---|---|
+| Yahoo down / network blip | 3 retries with backoff, then the last good frame is reused; the cycle never dies |
+| Feed frozen during session | Logs a loud `feed appears STALE` warning |
+| Corrupt bars (NaN, zero, high<low) | Dropped before they reach the engine |
+| Telegram 429 rate limit | Honours `retry_after`, then retries |
+| Telegram delivery fails | Alert is **not** marked sent — retried next cycle |
+| Bad token / wrong chat | Logged as a config error (no pointless retries) |
+| Corrupt or tz-naive state file | Re-baselines instead of crashing |
+| Long outage / big backlog | Only the newest 5 closed bars alert — no burst of stale signals |
+| Scanner restart | Dedupe ledger persists; a delivered alert never repeats |
 
 ---
 
