@@ -196,12 +196,15 @@ class LiveScanner:
                 changed = True
         return changed
 
-    @staticmethod
-    def _level_of(kind: str, row) -> float:
+    def _level_of(self, kind: str, row) -> float:
+        # Which pool a BUY/SELL refers to depends on the signal mapping:
+        #   default (fade)  BUY <- fresh SSL, SELL <- fresh BSL
+        #   magnet          BUY <- fresh BSL, SELL <- fresh SSL
+        magnet = self.params.magnet
         if kind == "BUY":
-            return row["new_ssl_lvl"]
+            return row["new_bsl_lvl"] if magnet else row["new_ssl_lvl"]
         if kind == "SELL":
-            return row["new_bsl_lvl"]
+            return row["new_ssl_lvl"] if magnet else row["new_bsl_lvl"]
         if kind == "SWEEP_SSL":
             return row["swept_ssl_lvl"]
         if kind == "SWEEP_BSL":
@@ -214,17 +217,37 @@ class LiveScanner:
     def _build_signal_msg(self, side: str, tf, ts, row, bar) -> str:
         sym = self.cfg.display_symbol
         entry = float(bar["close"])
+        # Pool mapping mirrors the Pine script:
+        #   default (fade):  buyPool = new SSL, sellPool = new BSL
+        #                    buyTgt  = nextBSL, sellTgt  = nextSSL
+        #   magnet:          buyPool = new BSL, sellPool = new SSL
+        #                    buyTgt  = new BSL, sellTgt  = new SSL (the pool itself)
+        magnet = self.params.magnet
         if side == "BUY":
-            pool_name, pool_lvl = row["new_ssl_name"], row["new_ssl_lvl"]
+            if magnet:
+                pool_name, pool_lvl = row["new_bsl_name"], row["new_bsl_lvl"]
+                target = row["new_bsl_lvl"]
+                swing_word = "HIGH"
+            else:
+                pool_name, pool_lvl = row["new_ssl_name"], row["new_ssl_lvl"]
+                target = row["next_bsl"]
+                swing_word = "LOW"
             sl, tp = row["sl_long"], row["tp_long"]
-            target = row["next_bsl"]
-            swing_txt = f"Swing confirmed {self.params.piv_len} bars after the actual LOW (non-repainting)"
+            swing_txt = (f"Swing confirmed {self.params.piv_len} bars after the "
+                         f"actual {swing_word} (non-repainting)")
             head = f"🟢 BUY SIGNAL — {sym} ({tf})"
         else:
-            pool_name, pool_lvl = row["new_bsl_name"], row["new_bsl_lvl"]
+            if magnet:
+                pool_name, pool_lvl = row["new_ssl_name"], row["new_ssl_lvl"]
+                target = row["new_ssl_lvl"]
+                swing_word = "LOW"
+            else:
+                pool_name, pool_lvl = row["new_bsl_name"], row["new_bsl_lvl"]
+                target = row["next_ssl"]
+                swing_word = "HIGH"
             sl, tp = row["sl_short"], row["tp_short"]
-            target = row["next_ssl"]
-            swing_txt = f"Swing confirmed {self.params.piv_len} bars after the actual HIGH (non-repainting)"
+            swing_txt = (f"Swing confirmed {self.params.piv_len} bars after the "
+                         f"actual {swing_word} (non-repainting)")
             head = f"🔴 SELL SIGNAL — {sym} ({tf})"
 
         lines = [
@@ -233,7 +256,7 @@ class LiveScanner:
             f"Entry: {_fmt_inr(entry)}",
             f"SL: {_fmt_inr(sl)}  ·  TP: {_fmt_inr(tp)}",
         ]
-        if target == target and not math.isnan(target):   # NaN-safe check
+        if target is not None and target == target:   # NaN-safe check
             lines.append(f"🎯 Nearest pool: {_fmt_inr(target)}")
         lines += [
             swing_txt,

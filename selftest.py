@@ -143,6 +143,72 @@ def test_magnet_mapping():
     print("  ok  magnet mapping flips directions")
 
 
+def _scanner_for(params, state_path):
+    """Build a LiveScanner with no network and no Telegram (offline messages)."""
+    from config import ScannerConfig
+    from scanner.data.mock import MockFeed
+    from scanner.live import LiveScanner
+
+    cfg = ScannerConfig()
+    cfg.telegram_enabled = False
+    cfg.market_hours_only = False
+    cfg.state_file = state_path
+    return LiveScanner(cfg, params=params, feed=MockFeed(), market_check=False)
+
+
+def test_signal_message_pool_mapping():
+    """A signal's message/dedupe level must name the pool that actually fired.
+
+    Regression: the message builder always read the SSL pool for BUY and the
+    BSL pool for SELL. Under the magnet mapping (BSL->BUY, SSL->SELL) those
+    columns are empty on the firing bar, so alerts went out as
+    "Fresh  pool start @ -" and the dedupe key level degraded to 'na'.
+    """
+    df = _base_frame()
+    _spike(df, 20, high=120.0)
+    _spike(df, 25, low=70.0)
+
+    with tempfile.TemporaryDirectory() as td:
+        state = os.path.join(td, "state.json")
+
+        # ---- default mapping: BSL -> SELL, SSL -> BUY -------------------
+        p = BSLSSLParams()
+        sig = compute_signals(df, p)
+        sc = _scanner_for(p, state)
+
+        msg = sc._build_signal_msg("SELL", "5m", df.index[28], sig.iloc[28], df.iloc[28])
+        assert "BSL-01" in msg, f"default SELL must name the fresh BSL pool:\n{msg}"
+        assert "@ 120.00" in msg, msg
+        assert "actual HIGH" in msg, msg
+        assert sc._level_of("SELL", sig.iloc[28]) == 120.0
+
+        msg = sc._build_signal_msg("BUY", "5m", df.index[33], sig.iloc[33], df.iloc[33])
+        assert "SSL-01" in msg, f"default BUY must name the fresh SSL pool:\n{msg}"
+        assert "@ 70.00" in msg, msg
+        assert "actual LOW" in msg, msg
+        assert sc._level_of("BUY", sig.iloc[33]) == 70.0
+
+        # ---- magnet mapping: BSL -> BUY, SSL -> SELL --------------------
+        pm = BSLSSLParams(sig_dir="BSL→BUY · SSL→SELL")
+        sigm = compute_signals(df, pm)
+        scm = _scanner_for(pm, state)
+
+        msg = scm._build_signal_msg("BUY", "5m", df.index[28], sigm.iloc[28], df.iloc[28])
+        assert "BSL-01" in msg, f"magnet BUY must name the fresh BSL pool:\n{msg}"
+        assert "@ 120.00" in msg, msg
+        assert "actual HIGH" in msg, msg
+        assert "pool start @ —" not in msg, "magnet BUY lost its pool level"
+        assert scm._level_of("BUY", sigm.iloc[28]) == 120.0, "magnet BUY dedupe level"
+
+        msg = scm._build_signal_msg("SELL", "5m", df.index[33], sigm.iloc[33], df.iloc[33])
+        assert "SSL-01" in msg, f"magnet SELL must name the fresh SSL pool:\n{msg}"
+        assert "@ 70.00" in msg, msg
+        assert "actual LOW" in msg, msg
+        assert scm._level_of("SELL", sigm.iloc[33]) == 70.0, "magnet SELL dedupe level"
+
+    print("  ok  signal message + dedupe level follow the pool mapping")
+
+
 def test_state_dedupe():
     with tempfile.TemporaryDirectory() as td:
         path = os.path.join(td, "state.json")
@@ -238,6 +304,7 @@ def main():
     test_equal_merge_no_signal()
     test_sweep()
     test_magnet_mapping()
+    test_signal_message_pool_mapping()
     test_expiry()
     test_state_dedupe()
     test_yfinance_column_normalization()
