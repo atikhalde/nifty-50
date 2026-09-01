@@ -35,15 +35,18 @@ class TelegramNotifier:
 
         Returns:
           True  -> delivered by at least one bot
-          None  -> telegram disabled / no bots configured (dry-run: log only)
-          False -> configured but delivery failed (caller should retry later)
+          None  -> explicitly disabled (dry-run: log only, safe to mark sent)
+          False -> delivery failed OR no bots configured (caller must NOT mark
+                   the alert as sent, otherwise credentials added later would
+                   never receive it)
         """
         if not self.enabled:
             log.info("[dry-run] (telegram disabled) alert:\n%s", text)
             return None
         if not self.bots:
-            log.warning("No Telegram bots configured (set BOT1_TOKEN/BOT2_TOKEN + CHAT_ID in .env) — alert logged only:\n%s", text)
-            return None
+            log.warning("No Telegram bots configured (set BOT1_TOKEN/BOT2_TOKEN + "
+                        "CHAT_ID in .env) — alert logged, NOT marked as sent:\n%s", text)
+            return False
 
         delivered = 0
         for name, token, cid in self.bots:

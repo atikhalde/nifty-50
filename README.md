@@ -65,6 +65,52 @@ When analyzing the TradingView chart indicator alongside Telegram scanner alerts
 | **Chart Anchor** | Plotted at `bar_index - pivLen` | Displayed explicitly in alert (`📍 Chart Anchor`) |
 | **Alert Delivery** | Instant via Webhook (`alert()`) | Dual Telegram bots + persistent deduplication |
 
+### 5. Cloud scanning (GitHub Actions) — optional, no server needed
+
+`.github/workflows/scanner.yml` runs the scanner on GitHub's cloud, so the
+**5m signals reach you even when your machine is off**. It runs **every
+5 minutes, Mon–Fri, during NSE hours (09:15–15:30 IST)** and can also be
+triggered manually (Actions tab → *NIFTY BSL/SSL Scanner* → **Run workflow**).
+
+Setup:
+1. Push this repo to GitHub and merge to `main`
+   (**scheduled workflows only run from the default branch**).
+2. Add **repository secrets** — *Settings → Secrets and variables → Actions*:
+
+   | Secret | Meaning |
+   |---|---|
+   | `BOT1_TOKEN` | Telegram bot 1 token (from @BotFather) |
+   | `BOT2_TOKEN` | Telegram bot 2 token |
+   | `CHAT_ID` | chat/group/channel ID for bot 1 (and bot 2) |
+   | `CHAT_ID_2` | optional — separate chat for bot 2 (defaults to `CHAT_ID`) |
+
+   The names must match exactly — the workflow reads them by these names.
+3. Done. Watch runs in the **Actions** tab; the first one appears within
+   5 minutes during market hours.
+
+How it works — **lookback mode** (`LOOKBACK_MINUTES=20`):
+- Every Actions run is a **fresh machine**, so it cannot wait for new bars
+  like the local scanner. Instead each run:
+  1. restores `data/sent_alerts.json` from the **Actions cache**;
+  2. downloads the full warm-up window (60 days of 5m bars) so the engine's
+     pool state converges exactly like a live scanner;
+  3. evaluates the BSL/SSL engine over all history, but **alerts only on
+     closed bars inside the last 20 minutes**;
+  4. saves the updated dedupe state back to the cache.
+- Because every alert key is persisted in the cached state file, **no alert
+  can ever be sent twice**, no matter how many fresh runs replay the same
+  bars. Old keys are trimmed weekly-style by `scanner/prune_state.py` to keep
+  the cache small.
+
+> 📌 The cloud workflow is **5m-only** (GitHub's minimum schedule is 5
+> minutes). Your **1m signals** still come from the local run
+> (`python run_scanner.py` with `.env`) — both can run side by side with the
+> same bots, and the shared no-duplicate guarantee still holds per run type.
+>
+> ⚠️ **yfinance** is free and unofficial; Yahoo can throttle — if you see
+> repeated fetch errors, raise `SCAN_INTERVAL_SEC` (local) or accept that a
+> throttled cloud run simply skips until the next 5-minute slot.
+
 ---
 
 ## 📱 Alert Formats
@@ -106,25 +152,27 @@ Bar: 2026-09-01 09:45 IST
 
 ## 🚀 Quick Start
 
-### 1. Installation
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+| Variable | Default | Meaning |
+|---|---|---|
+| `SYMBOL` / `DISPLAY_SYMBOL` | `^NSEI` / `NSE:NIFTY` | only the NIFTY index |
+| `TIMEFRAMES` | `1m,5m` | comma-separated intervals |
+| `SCAN_INTERVAL_SEC` | `20` | scan cadence |
+| `MARKET_HOURS_ONLY` | `true` | scan only 09:15–15:30 IST Mon–Fri |
+| `SESSION_START/END` | `09:15` / `15:30` | NSE session |
+| `LOOKBACK_MINUTES` | `0` | cloud lookback: scan the last N minutes of closed bars and exit (0 = live mode; the Actions workflow sets `20`) |
+| `SWEEP_ALERTS` | `true` | send separate 🧹 sweep alerts |
+| `PIV_LEN` | `8` | swing pivot strength (bars each side) |
+| `ATR_LEN` | `14` | ATR period |
+| `ZONE_ATR_MULT` | `0.25` | zone thickness × ATR |
+| `EQ_TOL_ATR` | `0.15` | equal H/L merge tolerance × ATR |
+| `MAX_POOLS` | `12` | max live pools per side |
+| `POOL_EXPIRY` | `300` | pool expiry in bars |
+| `SIG_DIR` | `BSL→SELL · SSL→BUY` | or `BSL→BUY · SSL→SELL` (magnet) |
+| `ATR_SL` / `RR_TARGET` | `1.2` / `2.0` | SL and TP multiples |
 
-### 2. Configure Credentials (.env)
-```bash
-cp .env.example .env
-```
-Fill in `.env`:
-```ini
-BOT1_TOKEN=1111111111:AA...        # Primary Telegram bot
-BOT2_TOKEN=2222222222:BB...        # Secondary Telegram bot
-CHAT_ID=-1001234567890             # Destination Telegram chat/channel
-CHAT_ID_2=                         # Optional second chat ID
-WEBHOOK_PORT=5000                  # Port for TradingView alerts
-```
+> ⚠️ **Settings must match your TradingView chart.** If you changed any input
+> in the indicator's settings panel, set the same value in `.env` — otherwise
+> signals will differ.
 
 ---
 
@@ -135,15 +183,19 @@ This mode connects directly to TradingView for **0ms latency**:
 ```bash
 python run_scanner.py --webhook
 ```
-1. Open TradingView with the `abcd.txt` indicator on `NSE:NIFTY` (5m / 1m).
-2. Create an Alert (`Condition: BSL / SSL Liquidity Start Signals`).
-3. Set **Webhook URL** to `http://<your-server-ip>:5000/webhook`.
-4. In the indicator settings, ensure `Alert Message Format` is set to `JSON (Webhook)`.
-
-### Mode B: Standalone Live Python Scanner
-Runs continuous background scanning with automated session awareness:
-```bash
-python run_scanner.py
+abcd.txt                        # the original Pine Script (reference)
+run_scanner.py                  # entry point
+config.py                       # env-based configuration
+selftest.py                     # offline engine parity tests
+.github/workflows/scanner.yml   # cloud scanner (5m, Mon-Fri, NSE hours)
+scanner/
+  indicators/bsl_ssl.py         # 1:1 Python port of the indicator
+  data/yfinance_feed.py         # yfinance feed (warm-up + incremental)
+  data/mock.py                  # synthetic data for offline preview
+  alerts/telegram.py            # dual-bot notifier
+  live.py                       # scan loop, lookback, dedupe, message building
+  state.py                      # persistent no-repeat dedupe
+  prune_state.py                # trims old dedupe keys (cache hygiene)
 ```
 
 ### Mode C: Offline Validation & Preview
@@ -153,7 +205,26 @@ python run_scanner.py --dump-sample # Preview sample Telegram alerts
 python run_scanner.py --mock        # Stream mock data
 ```
 
+## 🔧 Troubleshooting
+
+- **Actions run is green but no Telegram alert arrives**: check the run log
+  for `timeframe 5m failed` / `yfinance fetch failed`. yfinance is unofficial
+  and can be throttled — the run skips to the next 5-minute slot by design.
+  Also confirm the four secrets (`BOT1_TOKEN`, `BOT2_TOKEN`, `CHAT_ID`,
+  `CHAT_ID_2`) are set; if they are missing, alerts are only logged and are
+  **not** marked as sent, so they will be delivered once the secrets are added.
+- **Local scanner downloads bars once and then never sends again**: make sure
+  the yfinance feed can refresh (check `logs/scanner.log` for fetch errors).
+  The feed normalizes any yfinance column layout (TitleCase / MultiIndex
+  `(Price, Ticker)`) and passes a datetime — not a string — to the incremental
+  fetch, which yfinance 1.x requires.
+- **Sanity-check the feed without Telegram**:
+  `TELEGRAM_ENABLED=false python run_scanner.py --once` — signals that occur
+  are printed as dry-run alerts.
+
 ---
+
+## ⚠️ Notes & disclaimer
 
 ## 🔒 Strict Deduplication Guarantee
 Every alert generates a persistent composite key (`symbol|tf|kind|bar_time|level`) recorded in `data/sent_alerts.json`. Alerts are delivered **exactly once** across server restarts.
