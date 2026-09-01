@@ -177,21 +177,12 @@ class LiveScanner:
                 log.info("[%s] lookback: %d closed bar(s) in the last %dm window, alerts fired",
                          tf, len(new_bars), self.lookback_minutes)
             else:
-                log.info("[%s] lookback: %d closed bar(s) in window, nothing new to send", tf, len(new_bars))
-                # persist ONLY on change — a no-change run leaves the cached
-                # state file untouched (no useless cache churn every 5 min)
-                self.state.persist()
-                log.info("[%s] lookback: %d closed bar(s) in the last %dm "
-                         "window, alerts fired",
-                         tf, len(new_bars), self.lookback_minutes)
-            else:
                 log.info("[%s] lookback: %d closed bar(s) in window, nothing "
                          "new to send", tf, len(new_bars))
         else:
             self.state.set_last_evaluated(tf, new_bars[-1].isoformat())
             self.state.persist()
             if changed:
-                log.info("[%s] processed %d new closed bar(s), last=%s", tf, len(new_bars), new_bars[-1])
                 log.info("[%s] processed %d new closed bar(s), last=%s",
                          tf, len(new_bars), new_bars[-1])
 
@@ -306,29 +297,10 @@ class LiveScanner:
                 swing_word = "HIGH"
                 actual_side = "HIGH"
             sl, tp = row["sl_short"], row["tp_short"]
-                target = row["new_bsl_lvl"]
-                swing_word = "HIGH"
-            else:
-                pool_name, pool_lvl = row["new_ssl_name"], row["new_ssl_lvl"]
-                target = row["next_bsl"]
-                swing_word = "LOW"
-            sl, tp = row["sl_long"], row["tp_long"]
-            swing_txt = (f"Swing confirmed {self.params.piv_len} bars after the "
-                         f"actual {swing_word} (non-repainting)")
-            head = f"🟢 BUY SIGNAL — {sym} ({tf})"
-        else:
-            if magnet:
-                pool_name, pool_lvl = row["new_ssl_name"], row["new_ssl_lvl"]
-                target = row["new_ssl_lvl"]
-                swing_word = "LOW"
-            else:
-                pool_name, pool_lvl = row["new_bsl_name"], row["new_bsl_lvl"]
-                target = row["next_ssl"]
-                swing_word = "HIGH"
-            sl, tp = row["sl_short"], row["tp_short"]
-            swing_txt = (f"Swing confirmed {self.params.piv_len} bars after the "
-                         f"actual {swing_word} (non-repainting)")
             head = f"🔴 SELL SIGNAL — {sym} ({tf})"
+
+        swing_txt = (f"Swing confirmed {self.params.piv_len} bars after the "
+                     f"actual {swing_word} (non-repainting)")
 
         # Format times
         conf_time_str = ts.strftime('%Y-%m-%d %H:%M')

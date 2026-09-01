@@ -9,6 +9,7 @@ each scan cycle. Intraday bars are filtered to the NSE session
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -17,7 +18,63 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
-# Interval -> (pandas freq, lookback depth, warm-up period, yfinance period)
+# ---------------------------------------------------------------------------
+# TLS hardening
+# ---------------------------------------------------------------------------
+# yfinance prefers the curl_cffi backend, whose bundled BoringSSL frequently
+# drops the handshake to query2.finance.yahoo.com in sandboxed/CI networks
+# ("BoringSSL SSL_connect ... SSL_ERROR_SYSCALL"). Forcing the plain
+# requests/OpenSSL backend makes the connection succeed there.
+#
+# yfinance reads this env var at IMPORT time (yfinance/_http.py), so it must be
+# set before the first `import yfinance` — hence at module import time here.
+# YF_USE_CURL_CFFI is also set for older/newer variants of the same knob.
+os.environ.setdefault("YF_DISABLE_CURL_CFFI", "1")
+os.environ.setdefault("YF_USE_CURL_CFFI", "0")
+
+_YF_CONFIGURED = False
+
+
+def _patch_requests_exceptions() -> None:
+    """Add curl_cffi-only exception names to ``requests.exceptions``.
+
+    With the curl_cffi backend disabled, yfinance still references
+    ``requests.exceptions.DNSError`` (a curl_cffi-only class), which raises
+    ``AttributeError: module 'requests.exceptions' has no attribute 'DNSError'``
+    and turns every successful download into an "empty response". Alias the
+    missing names onto requests' own ConnectionError so the handler works.
+    """
+    import requests
+
+    for name in ("DNSError", "CurlError", "ImpersonateError"):
+        if not hasattr(requests.exceptions, name):
+            setattr(requests.exceptions, name, requests.exceptions.ConnectionError)
+
+
+def _import_yfinance():
+    """Import yfinance with the curl_cffi backend disabled (idempotent)."""
+    global _YF_CONFIGURED
+    _patch_requests_exceptions()
+    import yfinance as yf
+
+    if not _YF_CONFIGURED:
+        _YF_CONFIGURED = True
+        try:
+            from yfinance import _http as yf_http
+            if getattr(yf_http, "HAS_CURL_CFFI", False):
+                log.warning("yfinance is using the curl_cffi backend — TLS "
+                            "handshake failures to Yahoo are likely")
+        except Exception:  # noqa: BLE001 - internal module, best effort
+            pass
+        try:
+            # Bound the internal retry budget too (kwarg absent on old versions)
+            yf.set_config(retries=3)
+        except Exception:  # noqa: BLE001
+            log.debug("yf.set_config unavailable")
+    return yf
+
+
+# Interval -> pandas timedelta
 INTERVAL_DELTA = {
     "1m": pd.Timedelta(minutes=1),
     "5m": pd.Timedelta(minutes=5),
@@ -86,6 +143,12 @@ class YFinanceFeed:
                 if df is not None and not df.empty:
                     df = pd.concat([cached, df])
         if df is None or df.empty:
+            # Fetch failed (e.g. Yahoo TLS handshake drop). Serve the last good
+            # bars instead of raising — the scanner must never crash on a
+            # transient network failure; it will simply emit no new signals.
+            if cached is not None and not cached.empty:
+                log.warning("yfinance unavailable (tf=%s) — serving %d cached bars",
+                            tf, len(cached))
             return cached
         df = self._normalize(df)
         self._cache[tf] = df
@@ -93,7 +156,7 @@ class YFinanceFeed:
 
     def _download(self, tf: str, period: str | None = None,
                   start: pd.Timestamp | datetime | None = None,
-                  retries: int = 2) -> pd.DataFrame | None:
+                  retries: int = 5) -> pd.DataFrame | None:
         """Download OHLCV bars from yfinance.
 
         `period` (e.g. "7d"/"60d") is used for the warm-up fetch; `start` (a
@@ -102,7 +165,7 @@ class YFinanceFeed:
         'YYYY-MM-DD' strings or datetime objects (see _parse_user_dt), and a
         bad `start` silently makes the whole download return an empty frame.
         """
-        import yfinance as yf
+        yf = _import_yfinance()
         last_err: Exception | None = None
         for attempt in range(retries):
             try:
@@ -115,11 +178,13 @@ class YFinanceFeed:
                     df = yf.download(
                         self.symbol, interval=tf,
                         start=start, progress=False, auto_adjust=False,
+                        threads=False,
                     )
                 else:
                     df = yf.download(
                         self.symbol, interval=tf, period=period,
                         progress=False, auto_adjust=False,
+                        threads=False,
                     )
                 if df is not None and not df.empty:
                     return df
@@ -127,9 +192,13 @@ class YFinanceFeed:
             except Exception as e:                      # noqa: BLE001
                 last_err = e
             if attempt < retries - 1:
-                log.debug("yfinance fetch failed (tf=%s, attempt %d/%d): %s",
-                          tf, attempt + 1, retries, last_err)
-                time.sleep(1.0 * (attempt + 1))
+                # exponential backoff (1s, 2s, 4s, 8s ...), capped at 30s —
+                # Yahoo's TLS drops are transient and usually clear on retry.
+                delay = min(2.0 ** attempt, 30.0)
+                log.debug("yfinance fetch failed (tf=%s, attempt %d/%d), "
+                          "retrying in %.0fs: %s",
+                          tf, attempt + 1, retries, delay, last_err)
+                time.sleep(delay)
         if last_err is not None:
             log.warning("yfinance fetch failed (tf=%s): %s", tf, last_err)
         return None
