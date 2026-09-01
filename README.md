@@ -102,7 +102,21 @@ Bar: 2026-09-01 14:40 IST
 ### Strict no-duplicate guarantee
 Every alert gets a unique key (`symbol|tf|kind|bar-time|level`) persisted to
 `data/sent_alerts.json`. A signal is sent **exactly once** — never repeated,
-even across scanner restarts. Failed deliveries are retried until delivered.
+even across scanner restarts. Failed deliveries are queued and retried each
+cycle for up to `PENDING_MAX_AGE_MIN` (default 30 min); after that they are
+dropped with a warning — a signal that stale is more dangerous than a missed
+one in live markets.
+
+### Live-market safety guards
+- **Stale-bar guard** (`MAX_ALERT_AGE_MIN`, default 10): after a restart with
+  an old state file or a data outage, catch-up bars older than this are
+  evaluated but **never alerted** — no spam of untradable old signals.
+- **Fail-safe feed**: if Yahoo throttles or the network blips, the last good
+  cached bars are used and the cycle continues — one bad fetch never crashes
+  the scanner or a scan cycle.
+- **Closed bars only**: a bar is processed only once `bar_time + interval <= now`
+  (mirrors `alert.freq_once_per_bar_close`), and yfinance's stray `15:30`
+  auction bar is dropped to match TradingView's session.
 
 ---
 
@@ -116,6 +130,8 @@ even across scanner restarts. Failed deliveries are retried until delivered.
 | `MARKET_HOURS_ONLY` | `true` | scan only 09:15–15:30 IST Mon–Fri |
 | `SESSION_START/END` | `09:15` / `15:30` | NSE session |
 | `SWEEP_ALERTS` | `true` | send separate 🧹 sweep alerts |
+| `MAX_ALERT_AGE_MIN` | `10` | never alert bars older than this (restart/outage guard) |
+| `PENDING_MAX_AGE_MIN` | `30` | retry window for failed Telegram deliveries |
 | `PIV_LEN` | `8` | swing pivot strength (bars each side) |
 | `ATR_LEN` | `14` | ATR period |
 | `ZONE_ATR_MULT` | `0.25` | zone thickness × ATR |

@@ -6,6 +6,6 @@
 __pycache__/
 *.pyc
 
-# runtime artifacts
+# runtime artifacts (repo root only — NOT scanner/data/, which is source code)
 logs/
-data/
+/data/

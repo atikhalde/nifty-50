@@ -155,14 +155,165 @@ def test_state_dedupe():
         s2 = SentState(path)                        # reload from disk
         assert s2.already_sent(key), "dedupe must survive restart"
         assert s2.last_evaluated["5m"] == "2026-08-31T14:35:00+05:30"
+
+        # pending queue: survives restart, cleared once delivered
+        s2.add_pending("k2", "hello", "2026-08-31T14:36:00+05:30")
+        s2.persist()
+        s3 = SentState(path)
+        assert "k2" in s3.pending and s3.pending["k2"]["text"] == "hello"
+        s3.mark("k2")
+        assert "k2" not in s3.pending and s3.already_sent("k2")
+        # marking as sent blocks re-queueing
+        s3.add_pending("k2", "hello", "2026-08-31T14:37:00+05:30")
+        assert "k2" not in s3.pending
     print("  ok  persistent dedupe across restarts")
+
+
+def test_feed_normalization():
+    """YFinanceFeed._normalize: session filter, dedupe, tz, NaN, MultiIndex."""
+    from scanner.data.yfinance_feed import YFinanceFeed
+
+    feed = YFinanceFeed(symbol="^NSEI", tz="Asia/Kolkata")
+    idx = pd.DatetimeIndex([
+        "2026-08-31 09:14",   # pre-open -> dropped
+        "2026-08-31 09:15",   # kept
+        "2026-08-31 12:00",   # kept (duplicated below)
+        "2026-08-31 12:00",   # duplicate -> keep last
+        "2026-08-31 13:00",   # NaN close -> dropped
+        "2026-08-31 15:29",   # kept (last real 1m bar)
+        "2026-08-31 15:30",   # stray auction bar -> dropped
+    ]).tz_localize("Asia/Kolkata")
+    raw = pd.DataFrame({
+        "Open":  [1, 2, 3, 3.5, 5, 6, 7],
+        "High":  [1, 2, 3, 3.5, 5, 6, 7],
+        "Low":   [1, 2, 3, 3.5, 5, 6, 7],
+        "Close": [1, 2, 3, 3.5, np.nan, 6, 7],
+        "Volume": [0] * 7,
+    }, index=idx)
+
+    df = feed._normalize(raw)
+    assert list(df.columns)[:4] == ["open", "high", "low", "close"], "lower-case OHLC"
+    assert len(df) == 3, f"expected 3 bars after filtering, got {len(df)}"
+    assert df.index.is_unique and df.index.is_monotonic_increasing
+    assert float(df["close"].iloc[1]) == 3.5, "duplicate timestamp must keep the LATEST value"
+    assert str(df.index.tz) == "Asia/Kolkata"
+
+    # MultiIndex columns (yf.download style) also normalise
+    raw2 = raw.copy()
+    raw2.columns = pd.MultiIndex.from_product([raw.columns, ["^NSEI"]])
+    df2 = feed._normalize(raw2)
+    assert list(df2.columns)[:4] == ["open", "high", "low", "close"]
+
+    # tz-naive input gets localised (UTC) then converted
+    raw3 = raw.copy()
+    raw3.index = raw3.index.tz_localize(None)
+    df3 = feed._normalize(raw3)
+    assert df3 is None or str(df3.index.tz) == "Asia/Kolkata"
+    print("  ok  feed normalisation (session filter, dedupe, tz, NaN, MultiIndex)")
+
+
+class _FakeNotifier:
+    """Notifier double: scripted results, records every send."""
+    def __init__(self, results=None):
+        self.enabled = True
+        self.bots = [("fake", "t", "c")]
+        self.sent: list[str] = []
+        self._results = list(results or [])
+
+    def send(self, text):
+        self.sent.append(text)
+        return self._results.pop(0) if self._results else True
+
+
+def _make_live_scanner(td, feed, notifier, tf="5m"):
+    from config import ScannerConfig
+    from scanner.live import LiveScanner
+
+    cfg = ScannerConfig()
+    cfg.timeframes = [tf]
+    cfg.market_hours_only = False
+    cfg.max_alert_age_min = 10**6          # mock bars are in the past
+    cfg.state_file = os.path.join(td, "state.json")
+    cfg.telegram_enabled = True
+    sc = LiveScanner(cfg, params=BSLSSLParams(), feed=feed)
+    sc.notifier = notifier
+    return sc
+
+
+def test_live_pipeline_end_to_end():
+    """MockFeed -> engine -> dedupe -> notifier, no duplicates across ticks."""
+    from scanner.data.mock import MockFeed
+
+    with tempfile.TemporaryDirectory() as td:
+        notifier = _FakeNotifier()
+        sc = _make_live_scanner(td, MockFeed(), notifier)
+
+        sc.tick()                                   # baseline: no history spam
+        assert notifier.sent == [], "first tick must only set the baseline"
+
+        for _ in range(120):                        # stream the rest
+            sc.tick()
+        n_alerts = len(notifier.sent)
+        assert n_alerts > 0, "streaming synthetic data must produce alerts"
+        assert len(set(notifier.sent)) == n_alerts, "no duplicate alert texts"
+
+        for _ in range(5):                          # feed exhausted -> no repeats
+            sc.tick()
+        assert len(notifier.sent) == n_alerts, "no alert may ever be re-sent"
+
+        for m in notifier.sent:
+            assert ("BUY SIGNAL" in m or "SELL SIGNAL" in m or "SWEPT" in m)
+            assert "NSE:NIFTY" in m
+    print(f"  ok  end-to-end pipeline: {n_alerts} unique alerts, zero duplicates")
+
+
+def test_failed_delivery_retry():
+    """A failed send must be retried on later ticks — never lost, never doubled."""
+    from scanner.data.mock import MockFeed
+
+    with tempfile.TemporaryDirectory() as td:
+        # every send fails at first
+        notifier = _FakeNotifier(results=[False] * 500)
+        sc = _make_live_scanner(td, MockFeed(), notifier)
+        sc.tick()                                   # baseline
+        for _ in range(40):
+            sc.tick()
+        assert len(sc.state.pending) > 0, "failed alerts must be queued as pending"
+        n_pending = len(sc.state.pending)
+        pending_keys = set(sc.state.pending)
+
+        # deliveries recover
+        notifier._results = []                      # -> always True now
+        before = len(notifier.sent)
+        sc.tick()
+        assert len(sc.state.pending) == 0, "pending queue must drain once delivery works"
+        assert len(notifier.sent) >= before + n_pending
+        for k in pending_keys:
+            assert sc.state.already_sent(k), "retried alert must be marked sent"
+    print("  ok  failed deliveries queued and retried (never lost)")
+
+
+def test_stale_bar_guard():
+    """After a restart with an old state file, stale bars must NOT alert."""
+    from scanner.data.mock import MockFeed
+
+    with tempfile.TemporaryDirectory() as td:
+        notifier = _FakeNotifier()
+        sc = _make_live_scanner(td, MockFeed(), notifier)
+        sc.cfg.max_alert_age_min = 1                # everything mock is older
+        sc.tick()                                   # baseline
+        for _ in range(60):
+            sc.tick()
+        assert notifier.sent == [], "stale bars (older than the guard) must not alert"
+        assert len(sc.state.pending) == 0
+    print("  ok  stale-bar guard suppresses restart/outage catch-up spam")
 
 
 def test_expiry():
     df = _base_frame(n=400)
     _spike(df, 20, high=120.0)                      # pool @120 at bar 28
     p = BSLSSLParams(pool_expiry=100)
-    sig = compute_signals(df, p)
+    _ = compute_signals(df, p)   # first pass (pool @120 created, later expires)
     # pool created bar 28, expires when j - 28 > 100 -> bar 129.
     # Spike close is ABOVE the pool level so the pool expires instead of sweeping.
     _spike(df, 135, high=140.0, close=125.0)        # NEW pivot (140-120=20 > eqTol)
@@ -181,6 +332,10 @@ def main():
     test_magnet_mapping()
     test_expiry()
     test_state_dedupe()
+    test_feed_normalization()
+    test_live_pipeline_end_to_end()
+    test_failed_delivery_retry()
+    test_stale_bar_guard()
     print("\nALL CHECKS PASSED ✅")
 
 

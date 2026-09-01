@@ -77,6 +77,7 @@ class LiveScanner:
             log.debug("market closed — idle")
             return
         now = datetime.now(self.tz)
+        self._retry_pending(now)
         for tf in self.cfg.timeframes:
             try:
                 df = self.feed.get_bars(tf)
@@ -96,6 +97,39 @@ class LiveScanner:
         return dtime.fromisoformat(self.cfg.session_start) <= t <= dtime.fromisoformat(self.cfg.session_end)
 
     # ------------------------------------------------------------------
+    def _retry_pending(self, now) -> None:
+        """Re-deliver alerts that previously failed (never silently dropped).
+
+        A pending alert older than `pending_max_age_min` is discarded with a
+        warning — in live markets a signal that is that stale is more
+        dangerous than a missed one.
+        """
+        if not self.state.pending:
+            return
+        max_age = pd.Timedelta(minutes=getattr(self.cfg, "pending_max_age_min", 30))
+        changed = False
+        for key, item in list(self.state.pending.items()):
+            try:
+                queued = pd.Timestamp(item.get("queued", now.isoformat()))
+                queued = queued.tz_localize(self.tz) if queued.tz is None else queued.tz_convert(self.tz)
+            except Exception:
+                queued = pd.Timestamp(now)
+            if pd.Timestamp(now) - queued > max_age:
+                log.warning("Dropping stale undelivered alert (>%s old): %s", max_age, key)
+                self.state.drop_pending(key)
+                changed = True
+                continue
+            result = self.notifier.send(item.get("text", ""))
+            if result is False:
+                log.warning("Retry failed, will try again next cycle: %s", key)
+            else:
+                self.state.mark(key)
+                log.info("Pending alert delivered on retry: %s", key)
+                changed = True
+        if changed:
+            self.state.persist()
+
+    # ------------------------------------------------------------------
     def _process_new_closed_bars(self, tf, df, sig, now) -> None:
         delta = INTERVAL_DELTA.get(tf, pd.Timedelta(minutes=5))
         closed = df.index[(df.index + delta) <= now]
@@ -110,15 +144,33 @@ class LiveScanner:
             log.info("[%s] baseline set at %s (skipping history)", tf, closed[-1])
             return
 
-        threshold = pd.Timestamp(last_ev).tz_convert(self.tz)
+        threshold = pd.Timestamp(last_ev)
+        threshold = (threshold.tz_localize(self.tz) if threshold.tz is None
+                     else threshold.tz_convert(self.tz))
         new_bars = closed[closed > threshold]
         if len(new_bars) == 0:
             return
 
+        # Never alert stale bars (e.g. after a restart with an old state file
+        # or a long data outage): a signal from 30 minutes ago is not tradable.
+        max_age = pd.Timedelta(minutes=getattr(self.cfg, "max_alert_age_min", 10))
+        cutoff = pd.Timestamp(now) - max_age
+        stale = [ts for ts in new_bars if (ts + delta) < cutoff]
+        fresh = [ts for ts in new_bars if (ts + delta) >= cutoff]
+        if stale:
+            log.warning("[%s] skipping %d stale bar(s) older than %s min (restart/outage catch-up)",
+                        tf, len(stale), getattr(self.cfg, "max_alert_age_min", 10))
+
         changed = False
-        for ts in new_bars:
+        for ts in fresh:
             row = sig.loc[ts]
             bar = df.loc[ts]
+            # defensive: if a feed ever returns duplicate timestamps,
+            # .loc gives a frame — act on the latest snapshot
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[-1]
+            if isinstance(bar, pd.DataFrame):
+                bar = bar.iloc[-1]
             changed |= self._emit_bar(tf, ts, row, bar)
 
         self.state.set_last_evaluated(tf, new_bars[-1].isoformat())
@@ -144,11 +196,15 @@ class LiveScanner:
         for kind, text in alerts:
             lvl = self._level_of(kind, row)
             key = f"{self.cfg.display_symbol}|{tf}|{kind}|{ts.isoformat()}|{round(lvl, 4) if lvl == lvl else 'na'}"
-            if self.state.already_sent(key):
+            if self.state.already_sent(key) or key in self.state.pending:
                 continue
             result = self.notifier.send(text)
             if result is False:
-                log.warning("Alert delivery failed, will retry next cycle: %s", key)
+                # Queue for retry on the next cycles — NOT lost even though
+                # last_evaluated moves past this bar.
+                self.state.add_pending(key, text, datetime.now(self.tz).isoformat())
+                log.warning("Alert delivery failed, queued for retry: %s", key)
+                changed = True
             else:
                 # delivered (True) or dry-run/logged (None) — never send again
                 self.state.mark(key)

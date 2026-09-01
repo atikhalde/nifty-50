@@ -56,6 +56,14 @@ class TelegramNotifier:
                 )
                 if r.status_code == 200 and r.json().get("ok"):
                     delivered += 1
+                elif r.status_code == 429:
+                    retry_after = None
+                    try:
+                        retry_after = r.json().get("parameters", {}).get("retry_after")
+                    except Exception:
+                        pass
+                    log.warning("[%s] Telegram rate-limited (429), retry_after=%s — will retry",
+                                name, retry_after)
                 else:
                     log.error("[%s] Telegram API error %s: %s", name, r.status_code, r.text[:300])
             except Exception:
