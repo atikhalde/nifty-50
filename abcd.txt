@@ -24,8 +24,8 @@
 //     the label is drawn back at the true swing start bar for visual chart clarity.
 //
 //  MULTI-SPEED TIERS
-//   * TIER 3 STANDARD — pivLen=8 confirmation, macro target tracking (original behaviour)
-//   * TIER 2 FAST     — fastPivLen=3 (15m on 5m, 3m on 1m) → 62% faster entries
+//   * TIER 3 STANDARD — pivLen=4 confirmation, macro target tracking (original behaviour)
+//   * TIER 2 FAST     — fastPivLen=3 (15m on 5m, 3m on 1m) → 25% faster than the 4-bar default
 //   * TIER 1 INSTANT  — 0-bar lag on the sweep candle close, wick SL, 1:2 R:R TP
 //     Each tier draws its own label and has a dedicated webhook alertcondition.
 // =====================================================================================
@@ -38,7 +38,7 @@ indicator("BSL / SSL Liquidity Start Signals", shorttitle="BSL/SSL Start", overl
 // =====================================================================================
 grpL = "① Liquidity Pools"
 showLiq       = input.bool(true,  "Enable liquidity engine",   group=grpL, tooltip="Master switch. Entry signals are generated when a NEW pool starts, so they require this ON.")
-pivLen        = input.int(8,      "Swing pivot strength",      minval=2, maxval=50, group=grpL, tooltip="Bars left + right needed to confirm a swing. Signals fire this many bars after the actual high/low — the unavoidable cost of not repainting.")
+pivLen        = input.int(4,      "Swing pivot strength",      minval=2, maxval=50, group=grpL, tooltip="Bars left + right needed to confirm a swing. Signals fire this many bars after the actual high/low — the unavoidable cost of not repainting.")
 zoneAtrMult   = input.float(0.25, "Zone thickness (× ATR)",    minval=0.05, maxval=2.0, step=0.05, group=grpL)
 eqTolAtr      = input.float(0.15, "Equal H/L tolerance (× ATR)", minval=0.02, maxval=1.0, step=0.01, group=grpL)
 maxPools      = input.int(12,     "Max live pools per side",   minval=2, maxval=30, group=grpL)
@@ -61,7 +61,7 @@ showSignals   = input.bool(true,  "Show BUY / SELL on new pools", group=grpS)
 sigDir        = input.string("BSL→SELL · SSL→BUY", "Signal direction", options=["BSL→SELL · SSL→BUY","BSL→BUY · SSL→SELL"], group=grpS, tooltip="BSL→SELL · SSL→BUY (default) fades the fresh swing: a new BSL above → SELL, a new SSL below → BUY. BSL→BUY · SSL→SELL is magnet logic: trade toward the fresh pool instead.")
 atrSL         = input.float(1.2,  "Stop loss (× ATR)",         minval=0.2, step=0.1, group=grpS)
 rrTarget      = input.float(2.0,  "Reward:Risk target",        minval=0.5, step=0.5, group=grpS)
-fastPivLen    = input.int(3,      "Fast swing pivot strength", minval=1, maxval=20, group=grpS, tooltip="TIER 2. 3 bars = 15m on a 5m chart, 3m on a 1m chart. 62% faster than Standard pivLen=8.")
+fastPivLen    = input.int(3,      "Fast swing pivot strength", minval=1, maxval=20, group=grpS, tooltip="TIER 2. 3 bars = 15m on a 5m chart, 3m on a 1m chart. 25% faster than Standard pivLen=4 by default.")
 showFastSig   = input.bool(true,  "Show FAST (3-bar) swing signals", group=grpS)
 showInstTrades= input.bool(true,  "Show INSTANT sweep trades (0-bar lag)", group=grpS)
 
@@ -89,6 +89,9 @@ f_zoneName(bool eq, bool buyside, int id) =>
 
 f_zoneText(string nm, int tch, int strn) =>
     lblMode == "Name only" ? nm : nm + " ×" + str.tostring(tch) + " " + f_stars(strn)
+
+f_timeStr(int t) =>
+    str.format_time(t, "yyyy-MM-dd HH:mm", "Asia/Kolkata")
 
 // strength 1-5: base 1, +1 equal H/L, +1 two+ touches, +1 four+ touches
 f_strength(bool eq, int tch) =>
@@ -316,7 +319,8 @@ if showLiq and array.size(sLvl) > 0
         lvl = array.get(sLvl, i)
         bb  = array.get(sBox, i)
         ll  = array.get(sLbl, i)
-      blOffset)
+        nm  = f_zoneName(array.get(sEq, i), false, array.get(sId, i))
+        box.set_right(bb, bar_index + lblOffset)
         label.set_x(ll, bar_index + lblOffset)
         if low < lvl and close > lvl
             sweptSSL := true
@@ -455,8 +459,8 @@ if showSignals and sellSig
        style=label.style_label_down, color=color.new(colSell, 12), textcolor=color.white, size=size.small)
 
 // =====================================================================================
-//  TIER 2 FAST SWING SIGNALS  (fastPivLen = 3 → 62% faster entries)
-//  Macro targets (nextBSL / nextSSL) still come from the intact pivLen=8 book.
+//  TIER 2 FAST SWING SIGNALS  (fastPivLen = 3 → 25% faster than the 4-bar default)
+//  Macro targets (nextBSL / nextSSL) still come from the intact standard pool book.
 // =====================================================================================
 fastBslStart = showLiq and not na(phFast)
 fastSslStart = showLiq and not na(plFast)
@@ -486,6 +490,23 @@ if showFastSig and fastSellSig
        style=label.style_label_down, color=color.new(#f5a524, 8), textcolor=color.white, size=size.tiny)
 
 // =====================================================================================
+//  TIER 2 FAST ALERTS
+// =====================================================================================
+fastPct = pivLen > 0 ? math.round(100.0 * (pivLen - fastPivLen) / pivLen) : 0
+
+if fastBuySig
+    msg = alertFmt == "JSON (Webhook)" ?
+       ("{\"action\":\"BUY\",\"speed\":\"fast\",\"piv_len\":" + str.tostring(fastPivLen) + ",\"symbol\":\"" + syminfo.ticker + "\",\"tf\":\"" + timeframe.period + "\",\"pool\":\"" + fastBuyNm + "\",\"pool_side\":\"" + (magnet ? "BSL" : "SSL") + "\",\"pool_lvl\":" + str.tostring(fastBuyLv) + ",\"entry\":" + str.tostring(close) + ",\"sl\":" + str.tostring(slLong) + ",\"tp\":" + str.tostring(tpLong) + ",\"target\":" + (na(buyTgt) ? "null" : str.tostring(buyTgt)) + ",\"swing_bar_time\":\"" + f_timeStr(time[fastPivLen]) + "\",\"bar_time\":\"" + f_timeStr(time) + "\"}") :
+       ("🟢 BUY SIGNAL — " + syminfo.ticker + " (" + timeframe.period + ") · FAST\n📌 Fresh " + fastBuyNm + " pool start @ " + str.tostring(fastBuyLv, format.mintick) + "\n💵 Entry: " + str.tostring(close, format.mintick) + "\n🛑 SL: " + str.tostring(slLong, format.mintick) + " · 🎯 TP: " + str.tostring(tpLong, format.mintick) + (na(buyTgt) ? "" : "\n🎯 Nearest pool: " + str.tostring(buyTgt, format.mintick)) + "\n📍 Chart Anchor (Swing " + (magnet ? "High" : "Low") + "): " + f_timeStr(time[fastPivLen]) + " IST\n⚡ Fast swing confirmed " + str.tostring(fastPivLen) + " bars after actual " + (magnet ? "HIGH" : "LOW") + " (" + str.tostring(fastPct) + "% faster, non-repainting)\n🕒 Execution Bar: " + f_timeStr(time) + " IST\nBar: " + f_timeStr(time) + " IST")
+    alert(msg, alert.freq_once_per_bar_close)
+
+if fastSellSig
+    msg = alertFmt == "JSON (Webhook)" ?
+       ("{\"action\":\"SELL\",\"speed\":\"fast\",\"piv_len\":" + str.tostring(fastPivLen) + ",\"symbol\":\"" + syminfo.ticker + "\",\"tf\":\"" + timeframe.period + "\",\"pool\":\"" + fastSellNm + "\",\"pool_side\":\"" + (magnet ? "SSL" : "BSL") + "\",\"pool_lvl\":" + str.tostring(fastSellLv) + ",\"entry\":" + str.tostring(close) + ",\"sl\":" + str.tostring(slShort) + ",\"tp\":" + str.tostring(tpShort) + ",\"target\":" + (na(sellTgt) ? "null" : str.tostring(sellTgt)) + ",\"swing_bar_time\":\"" + f_timeStr(time[fastPivLen]) + "\",\"bar_time\":\"" + f_timeStr(time) + "\"}") :
+       ("🔴 SELL SIGNAL — " + syminfo.ticker + " (" + timeframe.period + ") · FAST\n📌 Fresh " + fastSellNm + " pool start @ " + str.tostring(fastSellLv, format.mintick) + "\n💵 Entry: " + str.tostring(close, format.mintick) + "\n🛑 SL: " + str.tostring(slShort, format.mintick) + " · 🎯 TP: " + str.tostring(tpShort, format.mintick) + (na(sellTgt) ? "" : "\n🎯 Nearest pool: " + str.tostring(sellTgt, format.mintick)) + "\n📍 Chart Anchor (Swing " + (magnet ? "Low" : "High") + "): " + f_timeStr(time[fastPivLen]) + " IST\n⚡ Fast swing confirmed " + str.tostring(fastPivLen) + " bars after actual " + (magnet ? "LOW" : "HIGH") + " (" + str.tostring(fastPct) + "% faster, non-repainting)\n🕒 Execution Bar: " + f_timeStr(time) + " IST\nBar: " + f_timeStr(time) + " IST")
+    alert(msg, alert.freq_once_per_bar_close)
+
+// =====================================================================================
 //  TIER 1 INSTANT SWEEP TRADES  (0-bar lag, wick SL, 1:2 R:R TP)
 // =====================================================================================
 instBuySig  = showInstTrades and sweptSSL
@@ -511,9 +532,11 @@ if showInstTrades and instSellSig
 
 // =====================================================================================
 //  ALERTS (Webhook & Multi-Channel Telegram Parity)
+//  Use TradingView's "Any alert() function call" to deliver the rich JSON below;
+//  the named alertcondition entries are lightweight UI conditions only.
 // =====================================================================================
-alertcondition(buySig,      "BUY — Standard (8-bar)",     "BSL/SSL STANDARD: new liquidity pool started → BUY")
-alertcondition(sellSig,     "SELL — Standard (8-bar)",    "BSL/SSL STANDARD: new liquidity pool started → SELL")
+alertcondition(buySig,      "BUY — Standard (4-bar)",     "BSL/SSL STANDARD: new liquidity pool started → BUY")
+alertcondition(sellSig,     "SELL — Standard (4-bar)",    "BSL/SSL STANDARD: new liquidity pool started → SELL")
 alertcondition(fastBuySig,  "BUY — Fast swing (3-bar)",   "BSL/SSL FAST: 3-bar swing confirmed → BUY")
 alertcondition(fastSellSig, "SELL — Fast swing (3-bar)",  "BSL/SSL FAST: 3-bar swing confirmed → SELL")
 alertcondition(instBuySig,  "BUY — Instant sweep (0-bar)","BSL/SSL INSTANT: SSL sweep reclaim → BUY (wick SL, 1:2)")
@@ -521,56 +544,38 @@ alertcondition(instSellSig, "SELL — Instant sweep (0-bar)","BSL/SSL INSTANT: B
 alertcondition(sweptSSL,    "Sell-side sweep",            "BSL/SSL: sell-side liquidity swept")
 alertcondition(sweptBSL,    "Buy-side sweep",             "BSL/SSL: buy-side liquidity swept")
 
-f_timeStr(int t) =>
-    str.format_time(t, "yyyy-MM-dd HH:mm", "Asia/Kolkata")
-
 if buySig
-    msg = alertFmt == "JSON (Webhook)" ? 
-       ('{"action":"BUY","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","pool":"' + buyPoolNm + '","pool_lvl":' + str.tostring(buyPoolLv) + ',"entry":' + str.tostring(close) + ',"sl":' + str.tostring(slLong) + ',"tp":' + str.tostring(tpLong) + ',"target":' + (na(buyTgt) ? 'null' : str.tostring(buyTgt)) + ',"swing_bar_time":"' + f_timeStr(time[pivLen]) + '","bar_time":"' + f_timeStr(time) + '"}') :
-       ("🟢 BUY SIGNAL — " + syminfo.ticker + " (" + timeframe.period + ")\n📌 Fresh " + buyPoolNm + " pool start @ " + str.tostring(buyPoolLv, format.mintick) + "\n💵 Entry: " + str.tostring(close, format.mintick) + "\n🛑 SL: " + str.tostring(slLong, format.mintick) + " · 🎯 TP: " + str.tostring(tpLong, format.mintick) + (na(buyTgt) ? "" : "\n🎯 Nearest pool: " + str.tostring(buyTgt, format.mintick)) + "\n📍 Chart Anchor (Swing Low): " + f_timeStr(time[pivLen]) + " IST\n⚡ Swing confirmed " + str.tostring(pivLen) + " bars after actual LOW (non-repainting)\nBar: " + f_timeStr(time) + " IST")
+    msg = alertFmt == "JSON (Webhook)" ?
+       ("{\"action\":\"BUY\",\"speed\":\"standard\",\"piv_len\":" + str.tostring(pivLen) + ",\"symbol\":\"" + syminfo.ticker + "\",\"tf\":\"" + timeframe.period + "\",\"pool\":\"" + buyPoolNm + "\",\"pool_side\":\"" + (magnet ? "BSL" : "SSL") + "\",\"pool_lvl\":" + str.tostring(buyPoolLv) + ",\"entry\":" + str.tostring(close) + ",\"sl\":" + str.tostring(slLong) + ",\"tp\":" + str.tostring(tpLong) + ",\"target\":" + (na(buyTgt) ? "null" : str.tostring(buyTgt)) + ",\"swing_bar_time\":\"" + f_timeStr(time[pivLen]) + "\",\"bar_time\":\"" + f_timeStr(time) + "\"}") :
+       ("🟢 BUY SIGNAL — " + syminfo.ticker + " (" + timeframe.period + ")\n📌 Fresh " + buyPoolNm + " pool start @ " + str.tostring(buyPoolLv, format.mintick) + "\n💵 Entry: " + str.tostring(close, format.mintick) + "\n🛑 SL: " + str.tostring(slLong, format.mintick) + " · 🎯 TP: " + str.tostring(tpLong, format.mintick) + (na(buyTgt) ? "" : "\n🎯 Nearest pool: " + str.tostring(buyTgt, format.mintick)) + "\n📍 Chart Anchor (Swing " + (magnet ? "High" : "Low") + "): " + f_timeStr(time[pivLen]) + " IST\n⚡ Swing confirmed " + str.tostring(pivLen) + " bars after actual " + (magnet ? "HIGH" : "LOW") + " (non-repainting)\nBar: " + f_timeStr(time) + " IST")
     alert(msg, alert.freq_once_per_bar_close)
 
 if sellSig
-    msg = alertFmt == "JSON (Webhook)" ? 
-       ('{"action":"SELL","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","pool":"' + sellPoolNm + '","pool_lvl":' + str.tostring(sellPoolLv) + ',"entry":' + str.tostring(close) + ',"sl":' + str.tostring(slShort) + ',"tp":' + str.tostring(tpShort) + ',"target":' + (na(sellTgt) ? 'null' : str.tostring(sellTgt)) + ',"swing_bar_time":"' + f_timeStr(time[pivLen]) + '","bar_time":"' + f_timeStr(time) + '"}') :
-       ("🔴 SELL SIGNAL — " + syminfo.ticker + " (" + timeframe.period + ")\n📌 Fresh " + sellPoolNm + " pool start @ " + str.tostring(sellPoolLv, format.mintick) + "\n💵 Entry: " + str.tostring(close, format.mintick) + "\n🛑 SL: " + str.tostring(slShort, format.mintick) + " · 🎯 TP: " + str.tostring(tpShort, format.mintick) + (na(sellTgt) ? "" : "\n🎯 Nearest pool: " + str.tostring(sellTgt, format.mintick)) + "\n📍 Chart Anchor (Swing High): " + f_timeStr(time[pivLen]) + " IST\n⚡ Swing confirmed " + str.tostring(pivLen) + " bars after actual HIGH (non-repainting)\nBar: " + f_timeStr(time) + " IST")
+    msg = alertFmt == "JSON (Webhook)" ?
+       ("{\"action\":\"SELL\",\"speed\":\"standard\",\"piv_len\":" + str.tostring(pivLen) + ",\"symbol\":\"" + syminfo.ticker + "\",\"tf\":\"" + timeframe.period + "\",\"pool\":\"" + sellPoolNm + "\",\"pool_side\":\"" + (magnet ? "SSL" : "BSL") + "\",\"pool_lvl\":" + str.tostring(sellPoolLv) + ",\"entry\":" + str.tostring(close) + ",\"sl\":" + str.tostring(slShort) + ",\"tp\":" + str.tostring(tpShort) + ",\"target\":" + (na(sellTgt) ? "null" : str.tostring(sellTgt)) + ",\"swing_bar_time\":\"" + f_timeStr(time[pivLen]) + "\",\"bar_time\":\"" + f_timeStr(time) + "\"}") :
+       ("🔴 SELL SIGNAL — " + syminfo.ticker + " (" + timeframe.period + ")\n📌 Fresh " + sellPoolNm + " pool start @ " + str.tostring(sellPoolLv, format.mintick) + "\n💵 Entry: " + str.tostring(close, format.mintick) + "\n🛑 SL: " + str.tostring(slShort, format.mintick) + " · 🎯 TP: " + str.tostring(tpShort, format.mintick) + (na(sellTgt) ? "" : "\n🎯 Nearest pool: " + str.tostring(sellTgt, format.mintick)) + "\n📍 Chart Anchor (Swing " + (magnet ? "Low" : "High") + "): " + f_timeStr(time[pivLen]) + " IST\n⚡ Swing confirmed " + str.tostring(pivLen) + " bars after actual " + (magnet ? "LOW" : "HIGH") + " (non-repainting)\nBar: " + f_timeStr(time) + " IST")
     alert(msg, alert.freq_once_per_bar_close)
 
 if sweptSSL
-    msg = alertFmt == "JSON (Webhook)" ? 
-       ('{"action":"SWEEP_SSL","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","pool_lvl":' + str.tostring(sweptSSLlvl) + ',"close":' + str.tostring(close) + ',"bar_time":"' + f_timeStr(time) + '"}') :
+    msg = alertFmt == "JSON (Webhook)" ?
+       ("{\"action\":\"SWEEP_SSL\",\"symbol\":\"" + syminfo.ticker + "\",\"tf\":\"" + timeframe.period + "\",\"pool_side\":\"SSL\",\"pool_lvl\":" + str.tostring(sweptSSLlvl) + ",\"close\":" + str.tostring(close) + ",\"bar_time\":\"" + f_timeStr(time) + "\"}") :
        ("🧹 SSL SWEPT (Bullish Reclaim) — " + syminfo.ticker + " (" + timeframe.period + ")\n📈 Sell-side liquidity pool @ " + str.tostring(sweptSSLlvl, format.mintick) + " was swept — bullish (price reclaimed)\nClose " + str.tostring(close, format.mintick) + " > level " + str.tostring(sweptSSLlvl, format.mintick) + "\n📍 Chart Marker: ▲ Green Triangle below bar\nBar: " + f_timeStr(time) + " IST")
     alert(msg, alert.freq_once_per_bar_close)
 
 if sweptBSL
-    msg = alertFmt == "JSON (Webhook)" ? 
-       ('{"action":"SWEEP_BSL","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","pool_lvl":' + str.tostring(sweptBSLlvl) + ',"close":' + str.tostring(close) + ',"bar_time":"' + f_timeStr(time) + '"}') :
+    msg = alertFmt == "JSON (Webhook)" ?
+       ("{\"action\":\"SWEEP_BSL\",\"symbol\":\"" + syminfo.ticker + "\",\"tf\":\"" + timeframe.period + "\",\"pool_side\":\"BSL\",\"pool_lvl\":" + str.tostring(sweptBSLlvl) + ",\"close\":" + str.tostring(close) + ",\"bar_time\":\"" + f_timeStr(time) + "\"}") :
        ("🧹 BSL SWEPT (Bearish Rejection) — " + syminfo.ticker + " (" + timeframe.period + ")\n📉 Buy-side liquidity pool @ " + str.tostring(sweptBSLlvl, format.mintick) + " was swept — bearish (price failed above)\nClose " + str.tostring(close, format.mintick) + " < level " + str.tostring(sweptBSLlvl, format.mintick) + "\n📍 Chart Marker: ▼ Red Triangle above bar\nBar: " + f_timeStr(time) + " IST")
-    alert(msg, alert.freq_once_per_bar_close)
-wing_bar_time":"' + f_timeStr(time[fastPivLen]) + '","bar_time":"' + f_timeStr(time) + '"}') :
-       ("🔴 SELL SIGNAL — " + syminfo.ticker + " (" + timeframe.period + ") · FAST\n📌 Fresh " + fastSellNm + " pool start @ " + str.tostring(fastSellLv, format.mintick) + "\n💵 Entry: " + str.tostring(close, format.mintick) + "\n🛑 SL: " + str.tostring(slShort, format.mintick) + " · 🎯 TP: " + str.tostring(tpShort, format.mintick) + (na(sellTgt) ? "" : "\n🎯 Nearest pool: " + str.tostring(sellTgt, format.mintick)) + "\n📍 Chart Anchor (Swing High): " + f_timeStr(time[fastPivLen]) + " IST\n⚡ Fast swing confirmed " + str.tostring(fastPivLen) + " bars after actual HIGH (62% faster, non-repainting)\n🕒 Execution Bar: " + f_timeStr(time) + " IST\nBar: " + f_timeStr(time) + " IST")
     alert(msg, alert.freq_once_per_bar_close)
 
 if instBuySig
-    msg = alertFmt == "JSON (Webhook)" ? 
-       ('{"action":"INST_BUY","speed":"instant","piv_len":0,"symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","pool":"SSL","pool_lvl":' + str.tostring(sweptSSLlvl) + ',"entry":' + str.tostring(close) + ',"sl":' + str.tostring(instSlLong) + ',"tp":' + str.tostring(instTpLong) + ',"close":' + str.tostring(close) + ',"swing_bar_time":"' + f_timeStr(time) + '","bar_time":"' + f_timeStr(time) + '"}') :
+    msg = alertFmt == "JSON (Webhook)" ?
+       ("{\"action\":\"INST_BUY\",\"speed\":\"instant\",\"piv_len\":0,\"symbol\":\"" + syminfo.ticker + "\",\"tf\":\"" + timeframe.period + "\",\"pool\":\"SSL\",\"pool_side\":\"SSL\",\"pool_lvl\":" + str.tostring(sweptSSLlvl) + ",\"entry\":" + str.tostring(close) + ",\"sl\":" + str.tostring(instSlLong) + ",\"tp\":" + str.tostring(instTpLong) + ",\"close\":" + str.tostring(close) + ",\"swing_bar_time\":\"" + f_timeStr(time) + "\",\"bar_time\":\"" + f_timeStr(time) + "\"}") :
        ("⚡ INSTANT SWEEP BUY — " + syminfo.ticker + " (" + timeframe.period + ") · TIER 1\n📌 SSL sweep reclaim (bullish) @ " + str.tostring(sweptSSLlvl, format.mintick) + "\n💵 Entry: " + str.tostring(close, format.mintick) + " (Sweep Candle Close)\n🛑 SL: " + str.tostring(instSlLong, format.mintick) + " (wick) · 🎯 TP: " + str.tostring(instTpLong, format.mintick) + " (1:2 R:R)\n📍 Chart Anchor (Sweep Low): " + f_timeStr(time) + " IST\n⚡ 0-bar lag — executed on sweep candle close\n🕒 Execution Bar: " + f_timeStr(time) + " IST\nBar: " + f_timeStr(time) + " IST")
     alert(msg, alert.freq_once_per_bar_close)
 
 if instSellSig
-    msg = alertFmt == "JSON (Webhook)" ? 
-       ('{"action":"INST_SELL","speed":"instant","piv_len":0,"symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","pool":"BSL","pool_lvl":' + str.tostring(sweptBSLlvl) + ',"entry":' + str.tostring(close) + ',"sl":' + str.tostring(instSlShort) + ',"tp":' + str.tostring(instTpShort) + ',"close":' + str.tostring(close) + ',"swing_bar_time":"' + f_timeStr(time) + '","bar_time":"' + f_timeStr(time) + '"}') :
+    msg = alertFmt == "JSON (Webhook)" ?
+       ("{\"action\":\"INST_SELL\",\"speed\":\"instant\",\"piv_len\":0,\"symbol\":\"" + syminfo.ticker + "\",\"tf\":\"" + timeframe.period + "\",\"pool\":\"BSL\",\"pool_side\":\"BSL\",\"pool_lvl\":" + str.tostring(sweptBSLlvl) + ",\"entry\":" + str.tostring(close) + ",\"sl\":" + str.tostring(instSlShort) + ",\"tp\":" + str.tostring(instTpShort) + ",\"close\":" + str.tostring(close) + ",\"swing_bar_time\":\"" + f_timeStr(time) + "\",\"bar_time\":\"" + f_timeStr(time) + "\"}") :
        ("⚡ INSTANT SWEEP SELL — " + syminfo.ticker + " (" + timeframe.period + ") · TIER 1\n📌 BSL sweep rejection (bearish) @ " + str.tostring(sweptBSLlvl, format.mintick) + "\n💵 Entry: " + str.tostring(close, format.mintick) + " (Sweep Candle Close)\n🛑 SL: " + str.tostring(instSlShort, format.mintick) + " (wick) · 🎯 TP: " + str.tostring(instTpShort, format.mintick) + " (1:2 R:R)\n📍 Chart Anchor (Sweep High): " + f_timeStr(time) + " IST\n⚡ 0-bar lag — executed on sweep candle close\n🕒 Execution Bar: " + f_timeStr(time) + " IST\nBar: " + f_timeStr(time) + " IST")
-    alert(msg, alert.freq_once_per_bar_close)
-
-if sweptSSL
-    msg = alertFmt == "JSON (Webhook)" ? 
-       ('{"action":"SWEEP_SSL","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","pool_lvl":' + str.tostring(sweptSSLlvl) + ',"close":' + str.tostring(close) + ',"bar_time":"' + f_timeStr(time) + '"}') :
-       ("🧹 SSL SWEPT (Bullish Reclaim) — " + syminfo.ticker + " (" + timeframe.period + ")\n📈 Sell-side liquidity pool @ " + str.tostring(sweptSSLlvl, format.mintick) + " was swept — bullish (price reclaimed)\nClose " + str.tostring(close, format.mintick) + " > level " + str.tostring(sweptSSLlvl, format.mintick) + "\n📍 Chart Marker: ▲ Green Triangle below bar\n🕒 Execution Bar: " + f_timeStr(time) + " IST\nBar: " + f_timeStr(time) + " IST")
-    alert(msg, alert.freq_once_per_bar_close)
-
-if sweptBSL
-    msg = alertFmt == "JSON (Webhook)" ? 
-       ('{"action":"SWEEP_BSL","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","pool_lvl":' + str.tostring(sweptBSLlvl) + ',"close":' + str.tostring(close) + ',"bar_time":"' + f_timeStr(time) + '"}') :
-       ("🧹 BSL SWEPT (Bearish Rejection) — " + syminfo.ticker + " (" + timeframe.period + ")\n📉 Buy-side liquidity pool @ " + str.tostring(sweptBSLlvl, format.mintick) + " was swept — bearish (price failed above)\nClose " + str.tostring(close, format.mintick) + " < level " + str.tostring(sweptBSLlvl, format.mintick) + "\n📍 Chart Marker: ▼ Red Triangle above bar\n🕒 Execution Bar: " + f_timeStr(time) + " IST\nBar: " + f_timeStr(time) + " IST")
     alert(msg, alert.freq_once_per_bar_close)

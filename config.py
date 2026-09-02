@@ -155,6 +155,10 @@ class ScannerConfig:
 
     # --- alert options ---
     sweep_alerts: bool = field(default_factory=lambda: _env_bool("SWEEP_ALERTS", True))
+    # The live Yahoo path is a separate source from TradingView webhooks.
+    # Source-specific keys allow both to alert while source_events records
+    # whether their values agree or conflict.
+    alert_source: str = field(default_factory=lambda: _env_str("ALERT_SOURCE", "YAHOO").upper())
     # Never send signals for closed bars older than this many minutes
     # (protects against a restart with an old state file / long data outage).
     # Applies to live incremental mode only — the lookback window bounds
@@ -196,6 +200,10 @@ class ScannerConfig:
         if self.log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
             log.warning("LOG_LEVEL=%r invalid — using INFO", self.log_level)
             self.log_level = "INFO"
+
+        if self.alert_source not in ("YAHOO", "TRADINGVIEW"):
+            log.warning("ALERT_SOURCE=%r invalid — using YAHOO", self.alert_source)
+            self.alert_source = "YAHOO"
 
     # ------------------------------------------------------------------
     def validate(self) -> list[str]:

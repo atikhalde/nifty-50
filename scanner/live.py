@@ -1,6 +1,9 @@
-"""Live scanner: yfinance feed -> BSL/SSL engine -> strict-dedupe -> dual Telegram.
+"""Live scanner: yfinance feed -> BSL/SSL engine -> source-aware Telegram.
 
-This version is 100% parity with the Pine script `abcd.txt`, plus Multi-Speed tiers:
+This version follows the canonical signal contract in the Pine script
+`abcd.txt`. Yahoo is independently source-tagged and compared with TradingView
+webhook events; feed-specific OHLC differences are surfaced instead of hidden.
+Multi-Speed tiers:
   * ATR = Wilder RMA of TR (ta.atr)
   * Pivots = ta.pivothigh/low(_, pivLen, pivLen) -> signal fires pivLen bars after actual swing (non-repainting)
   * Pool lifecycle = create -> sweep -> touch -> expiry (same order as Pine)
@@ -8,9 +11,9 @@ This version is 100% parity with the Pine script `abcd.txt`, plus Multi-Speed ti
   * SL/TP = close ∓ atr*atrSL / close ± atr*atrSL*rrTarget
   * Multi-Speed:
     - TIER 1 INSTANT — 0-bar lag on sweep candle close, wick SL, 1:2 R:R TP
-    - TIER 2 FAST    — fast_piv_len=3 (15m on 5m / 3m on 1m), 62% faster entries
-    - TIER 3 STANDARD — original piv_len=8 intact for macro target tracking
-  * Telegram message EXACTLY matches chart indicator's label values:
+    - TIER 2 FAST    — fast_piv_len=3 (15m on 5m / 3m on 1m), 25% faster than the 4-bar default
+    - TIER 3 STANDARD — original piv_len=4 intact for macro target tracking
+  * For a given source, Telegram fields mirror the chart payload contract:
     - pool name, pool level (actual swing high/low)
     - entry = close of confirmation (or sweep) bar
     - SL/TP from ATR at confirmation bar (standard/fast) or wick (instant)
@@ -37,6 +40,7 @@ import pandas as pd
 from scanner.alerts.telegram import TelegramNotifier
 from scanner.data.yfinance_feed import YFinanceFeed, INTERVAL_DELTA
 from scanner.indicators.bsl_ssl import BSLSSLParams, compute_signals
+from scanner.parity import event_correlation, source_key
 from scanner.state import SentState
 
 log = logging.getLogger("scanner")
@@ -81,6 +85,7 @@ class LiveScanner:
             session_start=cfg.session_start, session_end=cfg.session_end,
         )
         self.state = SentState(cfg.state_file)
+        self.source = str(getattr(cfg, "alert_source", "YAHOO")).upper()
         self.notifier = TelegramNotifier(
             bot1_token=cfg.bot1_token, bot2_token=cfg.bot2_token,
             chat_id=cfg.chat_id, chat_id_2=cfg.chat_id_2,
@@ -174,7 +179,7 @@ class LiveScanner:
         if now.weekday() >= 5:
             return False
         t = now.time()
-        return self._session_start <= t <= self._session_end
+        return self._session_start <= t < self._session_end
 
     # ------------------------------------------------------------------
     def _to_local_ts(self, value):
@@ -323,6 +328,93 @@ class LiveScanner:
                          tf, len(new_bars), new_bars[-1])
 
     # ------------------------------------------------------------------
+    def _target_of(self, kind: str, row):
+        """Return the target used by the corresponding Pine label.
+
+        Fast signals use the same target expression as Pine's fast labels:
+        ``buyTgt``/``sellTgt`` from the standard pool book. In magnet mode
+        that expression is the standard fresh pool, not the fast pivot level.
+        """
+        magnet = self.params.magnet
+        if kind in ("BUY", "FAST_BUY"):
+            return row["new_bsl_lvl"] if magnet else row["next_bsl"]
+        if kind in ("SELL", "FAST_SELL"):
+            return row["new_ssl_lvl"] if magnet else row["next_ssl"]
+        return float("nan")
+
+    @staticmethod
+    def _finite_or_none(value):
+        try:
+            number = float(value)
+            return number if math.isfinite(number) else None
+        except (TypeError, ValueError):
+            return None
+
+    def _pool_identity(self, kind: str, row) -> tuple[str | None, str | None]:
+        """Return the Pine pool name and side represented by an event."""
+        magnet = self.params.magnet
+        if kind == "BUY":
+            return ((row["new_bsl_name"], "BSL") if magnet
+                    else (row["new_ssl_name"], "SSL"))
+        if kind == "SELL":
+            return ((row["new_ssl_name"], "SSL") if magnet
+                    else (row["new_bsl_name"], "BSL"))
+        if kind == "FAST_BUY":
+            return ((row["fast_new_bsl_name"], "BSL") if magnet
+                    else (row["fast_new_ssl_name"], "SSL"))
+        if kind == "FAST_SELL":
+            return ((row["fast_new_ssl_name"], "SSL") if magnet
+                    else (row["fast_new_bsl_name"], "BSL"))
+        if kind in ("INST_BUY", "SWEEP_SSL"):
+            return row.get("swept_ssl_name", "SSL"), "SSL"
+        if kind in ("INST_SELL", "SWEEP_BSL"):
+            return row.get("swept_bsl_name", "BSL"), "BSL"
+        return None, None
+
+    def _event_details(self, kind: str, row, bar) -> dict:
+        """Extract numeric and pool fields used to compare Yahoo with TradingView."""
+        pool_name, pool_side = self._pool_identity(kind, row)
+        if kind in ("SWEEP_SSL", "SWEEP_BSL"):
+            return {
+                "pool_lvl": self._finite_or_none(self._level_of(kind, row)),
+                "pool_side": pool_side,
+                "close": self._finite_or_none(bar["close"]),
+            }
+        if kind in ("BUY", "SELL"):
+            sl = row["sl_long"] if kind == "BUY" else row["sl_short"]
+            tp = row["tp_long"] if kind == "BUY" else row["tp_short"]
+        elif kind in ("FAST_BUY", "FAST_SELL"):
+            sl = row["fast_sl_long"] if kind == "FAST_BUY" else row["fast_sl_short"]
+            tp = row["fast_tp_long"] if kind == "FAST_BUY" else row["fast_tp_short"]
+        elif kind == "INST_BUY":
+            sl, tp = row["inst_sl_long"], row["inst_tp_long"]
+        elif kind == "INST_SELL":
+            sl, tp = row["inst_sl_short"], row["inst_tp_short"]
+        else:
+            sl = tp = float("nan")
+        return {
+            "pool": pool_name,
+            "pool_side": pool_side,
+            "pool_lvl": self._finite_or_none(self._level_of(kind, row)),
+            "entry": self._finite_or_none(bar["close"]),
+            "sl": self._finite_or_none(sl),
+            "tp": self._finite_or_none(tp),
+            "target": self._finite_or_none(self._target_of(kind, row)),
+        }
+
+    def _annotate_source(self, text: str, status: dict) -> str:
+        """Show source provenance and any cross-source disagreement."""
+        lines = [text, f"📡 Source: {self.source}"]
+        relation = status.get("status")
+        sources = ", ".join(status.get("sources", []))
+        if relation == "confirmed":
+            lines.append(f"✅ Cross-source confirmation: {sources}")
+        elif relation == "conflict":
+            fields = ", ".join(status.get("fields", [])) or "values"
+            lines.append(f"⚠️ Source disagreement in: {fields} ({sources})")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     def _emit_bar(self, tf, ts, row, bar, df) -> bool:
         # Chart-anchor (actual swing bar) timestamps per speed tier — mirrors
         # where the Pine label is drawn (bar_index - pivLen / - fastPivLen);
@@ -368,12 +460,31 @@ class LiveScanner:
         changed = False
         for kind, text in alerts:
             lvl = self._level_of(kind, row)
-            # Unique key = symbol|tf|kind|bar-time|level -> exactly once forever
-            key = f"{self.cfg.display_symbol}|{tf}|{kind}|{ts.isoformat()}|{round(lvl, 4) if lvl == lvl and not math.isnan(lvl) else 'na'}"
-            if self.state.already_sent(key):
+            # Source-specific key: TradingView and Yahoo may both report the
+            # event, while retries from either source remain exactly-once.
+            key = source_key(self.source, self.cfg.display_symbol, tf, kind, ts,
+                             lvl, self.tz.key)
+            legacy_level = (round(float(lvl), 4)
+                            if lvl == lvl and not math.isnan(float(lvl)) else "na")
+            legacy_key = (f"{self.cfg.display_symbol}|{tf}|{kind}|{ts.isoformat()}|"
+                          f"{legacy_level}")
+            if not self.state.claim(key, (legacy_key,)):
+                # Keep deployments that upgrade from the old unscoped ledger
+                # from sending a duplicate during the migration.
                 continue
-            result = self.notifier.send(text)
+            correlation = event_correlation(self.cfg.display_symbol, tf, kind, ts,
+                                            self.tz.key)
+            relation = self.state.record_source_event(
+                correlation, self.source, self._event_details(kind, row, bar)
+            )
+            text = self._annotate_source(text, relation)
+            try:
+                result = self.notifier.send(text)
+            except Exception:
+                self.state.release(key)
+                raise
             if result is False:
+                self.state.release(key)
                 # Queue for re-delivery: last_evaluated moves past this bar
                 # after the loop, so without the pending queue a failed alert
                 # would be lost forever (never silently dropped).
@@ -408,19 +519,19 @@ class LiveScanner:
         return float("nan")
 
     # ------------------------------------------------------------------
-    # message builders - EXACTLY match Pine chart indicator
+    # message builders - mirror the Pine chart contract
     # ------------------------------------------------------------------
     def _build_signal_msg(self, side: str, tf, ts, row, bar, actual_ts, speed: str = "standard") -> str:
         """
-        Build telegram message that EXACTLY matches Pine indicator's label + alert.
+        Build the Telegram representation of Pine's label and alert fields.
 
         Dual timestamps on every speed tier:
           Chart Anchor  = where the Pine label is drawn (actual swing bar)
           Execution Bar = when the alert fires (confirmation bar)
 
         speed="standard" (TIER 3): piv_len confirmation, ATR SL/TP, macro next-pool target
-        speed="fast"     (TIER 2): fast_piv_len confirmation (62% faster), ATR SL/TP,
-                                   still aims at the standard (piv_len=8) macro pool
+        speed="fast"     (TIER 2): fast_piv_len confirmation (25% faster by default), ATR SL/TP,
+                                   still aims at the standard (piv_len=4) macro pool
         """
         sym = self.cfg.display_symbol
         entry = float(bar["close"])
@@ -433,8 +544,10 @@ class LiveScanner:
             if is_fast:
                 if magnet:
                     pool_name, pool_lvl = row["fast_new_bsl_name"], row["fast_new_bsl_lvl"]
-                    # Prefer the intact standard-book target when present
-                    target = row["next_bsl"] if not (isinstance(row["next_bsl"], float) and math.isnan(row["next_bsl"])) else row["fast_new_bsl_lvl"]
+                    # Pine's buyTgt is the standard fresh BSL. It may be
+                    # empty when only the fast pivot fired; do not substitute
+                    # the fast level or an unrelated next pool.
+                    target = row["new_bsl_lvl"]
                     swing_word = "HIGH"
                     actual_side = "High"
                 else:
@@ -494,7 +607,7 @@ class LiveScanner:
             f"🛑 SL: {_fmt_inr(sl)}  ·  🎯 TP: {_fmt_inr(tp)} (1:2 R:R)",
         ]
         if target is not None and target == target and not math.isnan(float(target) if target is not None else float("nan")):
-            if magnet and not is_fast:
+            if magnet:
                 lines.append(f"🎯 Target pool: {_fmt_inr(target)}")
             else:
                 lines.append(f"🎯 Nearest pool: {_fmt_inr(target)}")

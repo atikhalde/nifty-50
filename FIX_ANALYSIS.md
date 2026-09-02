@@ -1,5 +1,60 @@
 # Deep Analysis: Indicator Chart vs Scanner Telegram Mismatch
 
+## Current implementation — Fix Round 3 (2026-09-02)
+
+This round follows the user-approved configuration: **standard pivots use
+`pivLen=4`**, the separate fast tier remains `fastPivLen=3`, and both source
+paths may send alerts. TradingView and Yahoo are source-tagged independently;
+they are correlated rather than silently treated as identical feeds.
+
+### Repairs made
+
+1. **Restored the Pine source as a single valid alert path** — repaired the
+   missing SSL `box.set_right` line, removed the orphaned fast-alert fragment,
+   restored both FAST JSON/human alert blocks, removed duplicate trailing sweep
+   alerts, and converted the JSON construction to valid escaped Pine strings.
+2. **Made the standard confirmation four bars** — `abcd.txt`, Python defaults,
+   examples, and tests now use `pivLen=4` (four bars on each side of the pivot;
+   alert on the fourth confirmation bar). ATR remains fixed at `ta.atr(14)`.
+3. **Fixed fast magnet target parity** — a fast magnet event uses Pine's
+   standard `buyTgt`/`sellTgt` expression (`newBSLlvl`/`newSSLlvl`) rather than
+   an unrelated nearest pool or fast pivot level.
+4. **Made pool-side semantics explicit** — TradingView JSON now carries
+   `pool_side`, so magnet BUY/SELL messages correctly describe HIGH/LOW anchors.
+5. **Added source-aware dedupe and reconciliation** — Yahoo keys are prefixed
+   `YAHOO`, TradingView webhook keys are prefixed `TRADINGVIEW`; the persistent
+   `source_events` ledger reports `Cross-source confirmation` or
+   `Source disagreement in: ...` while allowing both sources to alert. The
+   shared state file is atomically locked/merged for concurrent live and webhook
+   processes, and same-process webhook workers claim keys before sending.
+6. **Aligned session filtering** — regular-session bars use `09:15 <= time <
+   15:30`, including the 15:25 bar and excluding the 15:30 start.
+
+### Important operating boundary
+
+The TradingView webhook carries the exact chart-side OHLC-derived values. The
+Yahoo path independently recomputes the engine from `^NSEI`; it can still
+legitimately disagree when candle OHLC, history length, timestamps, or pool
+sequence differs. In that case both source-tagged alerts remain visible and the
+state ledger identifies the differing numeric fields. Exact pool IDs require
+the same history or the TradingView payload.
+
+### Verification status
+
+Python syntax compilation, static source checks, and the complete self-test pass.
+The self-test was run in an isolated environment with `requirements.txt` and
+reported `ALL CHECKS PASSED`; the offline mock sample also ran successfully.
+Repeat locally with:
+
+```bash
+python -m compileall -q .
+python selftest.py
+python run_scanner.py --mock --dump-sample
+```
+
+The historical Fix Round 2 notes below describe the earlier repair and are kept
+for traceability.
+
 ## Fix Round 2 — merge-conflict repair & runtime errors (2026-09-01)
 
 The merge in PR #15 left the tree in a half-merged state: the scanner could
@@ -88,7 +143,7 @@ Pine script draws label at **actual swing bar** (`bar_index - pivLen`) but fires
 - **Fix**: Telegram now shows BOTH:
   - `Bar: 2026-09-01 10:25 IST` (confirmation, when alert fires)
   - `Actual LOW: 2026-09-01 09:45 IST` (where label is drawn)
-  - This makes it 100% traceable to chart
+  - This makes the chart anchor and execution timing traceable to the chart
 
 ### 4. Magnet Handling in Message Builder
 Old `_build_signal_msg`:
@@ -114,7 +169,7 @@ mask = df.index.to_series().apply(lambda ts: s <= ts.strftime("%H:%M") <= e)
 - Pine uses `format.mintick` (tick precision)
 - Scanner used `_fmt_inr` with Indian grouping and 2 decimals — values same, formatting slightly different but acceptable
 - More important: **values** must match — ATR, entry, SL, TP, nearest pool
-- Engine already 1:1 with Pine:
+- Engine follows the Pine contract:
   - ATR = Wilder RMA of TR (same as `ta.atr(14)`)
   - Pivots = strict `>` on both sides, confirmed `pivLen` bars later (non-repainting)
   - Pool lifecycle order: create BSL -> create SSL -> sweep BSL -> sweep SSL -> touch -> expiry -> signal (same as Pine)
@@ -124,7 +179,7 @@ mask = df.index.to_series().apply(lambda ts: s <= ts.strftime("%H:%M") <= e)
 
 ### 7. Data Source Difference (Unavoidable but Documented)
 - TradingView NSE:NIFTY feed vs yfinance ^NSEI may have slightly different OHLC due to exchange, adjustments, missing bars
-- yfinance 5m limited to 60 days, 1m to 7 days -> pool IDs (e.g., SSL-169) will diverge from long-history TradingView chart, but **signal logic converges after expiry window (300 bars)**
+- yfinance 5m limited to 60 days, 1m to 7 days -> pool IDs (e.g., SSL-169) will diverge from long-history TradingView chart, but signal state can only converge after a matching history window
 - **Fix**: Documented in `live.py` header and README, and ensured warm-up uses full 60d/7d window so pool state converges
 
 ## Fixes Applied
@@ -156,7 +211,7 @@ mask = df.index.to_series().apply(lambda ts: s <= ts.strftime("%H:%M") <= e)
 ## Verification
 
 ```bash
-python selftest.py  # 7 parity checks pass
+python selftest.py  # current suite passes all parity and hardening checks
 python run_scanner.py --mock --dump-sample  # shows new format with actual swing time
 SIG_DIR="BSL→BUY · SSL→SELL" python run_scanner.py --mock --dump-sample  # magnet correctly flips
 python run_scanner.py --mock --lookback 20 --verbose  # lookback mode works
@@ -169,7 +224,7 @@ Sample new telegram (default fade):
 Entry: 24,228.74
 SL: 24,156.67  ·  TP: 24,372.88
 🎯 Nearest pool: 24,411.91
-Swing confirmed 8 bars after the actual LOW (non-repainting)
+Swing confirmed 4 bars after the actual LOW (non-repainting)
 Bar: 2026-09-01 08:35 IST
 Actual LOW: 2026-09-01 07:55 IST
 ```
@@ -181,12 +236,12 @@ Sample magnet:
 Entry: 24,352.86
 SL: 24,270.59  ·  TP: 24,517.41
 🎯 Target pool: 24,411.91
-Swing confirmed 8 bars after the actual HIGH (non-repainting)
+Swing confirmed 4 bars after the actual HIGH (non-repainting)
 Bar: 2026-09-01 03:00 IST
 Actual HIGH: 2026-09-01 02:20 IST
 ```
 
-Now telegram **exactly matches** chart indicator's:
+Now Telegram uses the same canonical fields as the chart indicator:
 - Pool name & level (actual swing high/low)
 - Entry = close of confirmation bar
 - SL/TP from ATR at confirmation bar
@@ -194,10 +249,10 @@ Now telegram **exactly matches** chart indicator's:
 - Swing confirmation text with correct HIGH/LOW based on mapping
 - Both actual swing bar time (where label drawn) and confirmation bar time (where alert fires)
 
-## Recommendations for 100% Match
+## Recommendations for high-accuracy parity
 
 1. **Settings must match**: In TradingView indicator inputs, note PIV_LEN, ZONE_ATR_MULT, EQ_TOL_ATR, MAX_POOLS, POOL_EXPIRY, ATR_SL, RR_TARGET, SIG_DIR. Set same values in `.env` (see `.env.example`)
 2. **Use 5m timeframe**: Example used 5m, scanner default TIMEFRAMES=1m,5m — ensure both chart and scanner on same TF
 3. **Understand ID divergence**: Pool IDs (BSL-169) are sequence numbers from start of data. TradingView chart with months of history will have higher IDs than scanner with 60d warm-up, but signals (entry/SL/TP) still match after expiry window
 4. **Check data feed**: If yfinance and TradingView OHLC differ by few paise, SL/TP will differ slightly — unavoidable, but logic identical
-5. **No repaint**: Both chart and scanner fire signals only on bar close, 8 bars after actual swing — non-repainting confirmed
+5. **No repaint**: Both chart and scanner fire signals only on bar close, 4 bars after actual swing by default — non-repainting confirmed

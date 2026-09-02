@@ -8,8 +8,11 @@
 #   3. sends BUY / SELL / 🧹 sweep alerts to BOTH Telegram bots,
 #   4. saves the updated dedupe state back to the cache.
 #
-# Because every alert key is persisted in the cached state file, the same bar
-# can NEVER be alerted twice, no matter how many fresh runs replay it.
+# Because every source-specific alert key is persisted in the cached state
+# file, the Yahoo path can NEVER alert the same bar twice, no matter how many
+# fresh runs replay it. A separate TradingView process may alert independently;
+# its event is correlated through the shared ledger when the deployments share
+# the same state file.
 #
 # Manual: Actions tab -> "NIFTY BSL/SSL Scanner" -> Run workflow.
 #
@@ -78,7 +81,7 @@ jobs:
           if not scheduled:
               run = True
               print(f"Manual run ({t} IST) — scanning regardless of market hours.")
-          elif weekday and "09:15" <= t <= "15:30":
+          elif weekday and "09:15" <= t < "15:30":
               run = True
               print(f"Inside NSE hours ({t} IST) — scanning.")
           else:

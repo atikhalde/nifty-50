@@ -16,8 +16,8 @@ Validates:
   7. SentState persists and never re-sends the same key.
   8. Webhook payload formatter correctly processes TradingView JSON and plaintext.
   9. Dual timestamps (Chart Anchor vs Execution Bar) match accurately.
- 10. Multi-Speed TIER 2: fast_piv_len=3 fires 62% faster than piv_len=8.
- 11. Multi-Speed TIER 3: standard piv_len=8 remains intact for macro tracking.
+ 10. Multi-Speed TIER 2: fast_piv_len=3 fires 25% faster than piv_len=4 by default.
+ 11. Multi-Speed TIER 3: standard piv_len=4 remains intact for macro tracking.
  12. Multi-Speed TIER 1: instant sweep trades fire on the sweep candle (0-bar
      lag) with wick SL and 1:2 R:R TP.
  13. LiveScanner wiring: new closed bars produce (and dedupe) real alerts for
@@ -71,18 +71,18 @@ def test_pivot_and_sell_signal():
                df["close"].to_numpy(float), 14)
     assert np.allclose(sig["atr"].to_numpy(), atr, equal_nan=True), "ATR mismatch"
 
-    # confirmation bar = 20 + 8 = 28  (NOT bar 20 -> non-repainting)
+    # confirmation bar = 20 + 4 = 24  (NOT bar 20 -> non-repainting)
     assert not bool(sig["sell_sig"].iloc[20]), "signal must not fire on the swing bar"
-    assert bool(sig["sell_sig"].iloc[28]), "SELL must fire on confirmation bar 28"
-    assert sig["new_bsl_lvl"].iloc[28] == 120.0, "BSL level = pivot high"
-    assert sig["new_bsl_name"].iloc[28] == "BSL-01", "first BSL pool named BSL-01"
-    assert not bool(sig["buy_sig"].iloc[28]), "default mapping: BSL start -> SELL not BUY"
+    assert bool(sig["sell_sig"].iloc[24]), "SELL must fire on confirmation bar 24"
+    assert sig["new_bsl_lvl"].iloc[24] == 120.0, "BSL level = pivot high"
+    assert sig["new_bsl_name"].iloc[24] == "BSL-01", "first BSL pool named BSL-01"
+    assert not bool(sig["buy_sig"].iloc[24]), "default mapping: BSL start -> SELL not BUY"
 
     # SL/TP math: sl_long = close - atr*1.2 ; tp_long = close + atr*1.2*2
-    a28 = float(sig["atr"].iloc[28])
-    assert abs(sig["sl_long"].iloc[28] - (95.0 - a28 * 1.2)) < 1e-9
-    assert abs(sig["tp_long"].iloc[28] - (95.0 + a28 * 1.2 * 2.0)) < 1e-9
-    assert abs(sig["tp_long"].iloc[28] - 95.0) == 2 * abs(95.0 - sig["sl_long"].iloc[28])
+    a24 = float(sig["atr"].iloc[24])
+    assert abs(sig["sl_long"].iloc[24] - (95.0 - a24 * 1.2)) < 1e-9
+    assert abs(sig["tp_long"].iloc[24] - (95.0 + a24 * 1.2 * 2.0)) < 1e-9
+    assert abs(sig["tp_long"].iloc[24] - 95.0) == 2 * abs(95.0 - sig["sl_long"].iloc[24])
 
     # swing-locked: no NEW pool on bar 29
     assert not bool(sig["sell_sig"].iloc[29])
@@ -93,32 +93,32 @@ def test_buy_signal():
     df = _base_frame()
     _spike(df, 25, low=70.0)                       # swing low at bar 25
     sig = compute_signals(df, BSLSSLParams())
-    assert bool(sig["buy_sig"].iloc[33]), "BUY must fire on confirmation bar 33"
-    assert sig["new_ssl_lvl"].iloc[33] == 70.0
-    assert sig["new_ssl_name"].iloc[33] == "SSL-01"
+    assert bool(sig["buy_sig"].iloc[29]), "BUY must fire on confirmation bar 29"
+    assert sig["new_ssl_lvl"].iloc[29] == 70.0
+    assert sig["new_ssl_name"].iloc[29] == "SSL-01"
     print("  ok  pivot low + BUY on confirmation bar")
 
 
 def test_equal_merge_no_signal():
     df = _base_frame()
-    _spike(df, 20, high=120.0)                     # new pool @120  -> SELL at 28
+    _spike(df, 20, high=120.0)                     # new pool @120  -> SELL at 24
     _spike(df, 30, high=120.6, close=120.2)        # within eqTol   -> merge
-    _spike(df, 40, high=130.0)                     # new pool @130  -> SELL at 48
+    _spike(df, 40, high=130.0)                     # new pool @130  -> SELL at 44
     sig = compute_signals(df, BSLSSLParams())
 
-    assert bool(sig["sell_sig"].iloc[28])
-    assert not bool(sig["sell_sig"].iloc[38]), "equal high must merge, NOT signal"
-    assert np.isnan(sig["new_bsl_lvl"].iloc[38]), "no new pool on equal high"
-    assert bool(sig["sell_sig"].iloc[48]), "second distinct pool must signal"
-    assert sig["new_bsl_name"].iloc[48] == "BSL-02", "new pool gets next id"
-    assert sig["new_bsl_lvl"].iloc[48] == 130.0
+    assert bool(sig["sell_sig"].iloc[24])
+    assert not bool(sig["sell_sig"].iloc[34]), "equal high must merge, NOT signal"
+    assert np.isnan(sig["new_bsl_lvl"].iloc[34]), "no new pool on equal high"
+    assert bool(sig["sell_sig"].iloc[44]), "second distinct pool must signal"
+    assert sig["new_bsl_name"].iloc[44] == "BSL-02", "new pool gets next id"
+    assert sig["new_bsl_lvl"].iloc[44] == 130.0
     print("  ok  equal-high merge (no signal) + distinct pool (signal)")
 
 
 def test_sweep():
     df = _base_frame()
-    _spike(df, 20, high=120.0)                     # BSL @120 -> SELL at 28
-    _spike(df, 25, low=70.0)                       # SSL @70  -> BUY at 33
+    _spike(df, 20, high=120.0)                     # BSL @120 -> SELL at 24
+    _spike(df, 25, low=70.0)                       # SSL @70  -> BUY at 29
     _spike(df, 40, high=135.0, close=95.0)         # trade through both BSLs, close back in
     sig = compute_signals(df, BSLSSLParams())
 
@@ -127,11 +127,11 @@ def test_sweep():
     
     _spike(df, 50, high=140.0)
     sig2 = compute_signals(df, BSLSSLParams())
-    assert bool(sig2["sell_sig"].iloc[48]), "bar 40 high confirmed at 48 -> BSL-02"
-    assert sig2["new_bsl_name"].iloc[48] == "BSL-02"
+    assert bool(sig2["sell_sig"].iloc[44]), "bar 40 high confirmed at 44 -> BSL-02"
+    assert sig2["new_bsl_name"].iloc[44] == "BSL-02"
     assert bool(sig2["swept_bsl"].iloc[50]), "bar-50 spike sweeps pool @135"
-    assert bool(sig2["sell_sig"].iloc[58]), "new pool after sweep"
-    assert sig2["new_bsl_name"].iloc[58] == "BSL-03", "sequence continues after sweep"
+    assert bool(sig2["sell_sig"].iloc[54]), "new pool after sweep"
+    assert sig2["new_bsl_name"].iloc[54] == "BSL-03", "sequence continues after sweep"
     assert not bool(sig2["swept_ssl"].iloc[40]), "SSL must not be swept on bar 40 (low=90 > 70)"
     print("  ok  sweep detection + pool removal + id sequence")
 
@@ -142,19 +142,19 @@ def test_magnet_mapping():
     _spike(df, 25, low=70.0)
     p = BSLSSLParams(sig_dir="BSL→BUY · SSL→SELL")
     sig = compute_signals(df, p)
-    assert bool(sig["buy_sig"].iloc[28]), "magnet: BSL start -> BUY"
-    assert not bool(sig["sell_sig"].iloc[28])
-    assert bool(sig["sell_sig"].iloc[33]), "magnet: SSL start -> SELL"
-    assert not bool(sig["buy_sig"].iloc[33])
+    assert bool(sig["buy_sig"].iloc[24]), "magnet: BSL start -> BUY"
+    assert not bool(sig["sell_sig"].iloc[24])
+    assert bool(sig["sell_sig"].iloc[29]), "magnet: SSL start -> SELL"
+    assert not bool(sig["buy_sig"].iloc[29])
     print("  ok  magnet mapping flips directions")
 
 
 def test_fast_tier_signals():
-    """TIER 2: fast_piv_len=3 confirms the same swing 5 bars earlier (62%
-    faster than piv_len=8) without disturbing the standard tier."""
+    """TIER 2: fast_piv_len=3 confirms the same swing 1 bar earlier (25%
+    faster than the piv_len=4 default) without disturbing the standard tier."""
     df = _base_frame()
     _spike(df, 20, high=120.0)                     # swing high at bar 20
-    p = BSLSSLParams()                             # piv_len=8, fast_piv_len=3
+    p = BSLSSLParams()                             # piv_len=4, fast_piv_len=3
     sig = compute_signals(df, p)
 
     assert bool(sig["fast_bsl_start"].iloc[23]), "fast pivot confirmed at 20+3"
@@ -162,8 +162,8 @@ def test_fast_tier_signals():
     assert bool(sig["fast_sell_sig"].iloc[23]), "default fade: fast BSL -> FAST SELL"
     assert not bool(sig["sell_sig"].iloc[23]), "standard tier must NOT fire at bar 23"
     assert not bool(sig["fast_sell_sig"].iloc[20]), "fast tier is non-repainting too"
-    assert bool(sig["sell_sig"].iloc[28]), "standard tier still intact at bar 28"
-    assert round(100.0 * (p.piv_len - p.fast_piv_len) / p.piv_len) == 62
+    assert bool(sig["sell_sig"].iloc[24]), "standard tier still intact at bar 28"
+    assert round(100.0 * (p.piv_len - p.fast_piv_len) / p.piv_len) == 25
 
     # magnet flips the fast tier as well
     sigm = compute_signals(df, BSLSSLParams(sig_dir="BSL→BUY · SSL→SELL"))
@@ -173,8 +173,32 @@ def test_fast_tier_signals():
     # master switch disables the tier without touching the others
     sig_off = compute_signals(df, BSLSSLParams(fast_signals=False))
     assert not bool(sig_off["fast_sell_sig"].iloc[23])
-    assert bool(sig_off["sell_sig"].iloc[28]), "standard tier must survive FAST_SIGNALS=false"
-    print("  ok  TIER 2 fast swing fires 62% earlier (independent of TIER 3)")
+    assert bool(sig_off["sell_sig"].iloc[24]), "standard tier must survive FAST_SIGNALS=false"
+    print("  ok  TIER 2 fast swing fires 25% earlier (independent of TIER 3)")
+
+
+def test_fast_magnet_target_uses_standard_book():
+    """Fast magnet labels use Pine's standard fresh-pool target, not the
+    fast pivot or an unrelated nearest pool."""
+    df = _base_frame()
+    _spike(df, 20, high=120.0)  # standard/fast confirmations are 24/23
+    p = BSLSSLParams(sig_dir="BSL→BUY · SSL→SELL")
+    sig = compute_signals(df, p)
+    with tempfile.TemporaryDirectory() as td:
+        sc = _scanner_for(p, os.path.join(td, "state.json"))
+        # At fast confirmation 23 no standard pool exists yet: Pine buyTgt is na.
+        msg = sc._build_signal_msg("BUY", "5m", df.index[23], sig.iloc[23], df.iloc[23], df.index[20], speed="fast")
+        assert "Nearest pool:" not in msg and "Target pool:" not in msg, msg
+
+    # Use equal strengths to force both books to create on one bar. Pine's
+    # fast label then targets the standard fresh BSL, not the fast level.
+    p2 = BSLSSLParams(piv_len=3, fast_piv_len=3, sig_dir="BSL→BUY · SSL→SELL")
+    sig2 = compute_signals(df, p2)
+    with tempfile.TemporaryDirectory() as td:
+        sc2 = _scanner_for(p2, os.path.join(td, "state.json"))
+        msg = sc2._build_signal_msg("BUY", "5m", df.index[23], sig2.iloc[23], df.iloc[23], df.index[20], speed="fast")
+        assert "Target pool: 120.00" in msg, msg
+    print("  ok  fast magnet target follows the standard Pine pool book")
 
 
 def test_instant_sweep_tier():
@@ -243,37 +267,37 @@ def test_signal_message_pool_mapping():
         sig = compute_signals(df, p)
         sc = _scanner_for(p, state)
 
-        msg = sc._build_signal_msg("SELL", "5m", df.index[28], sig.iloc[28], df.iloc[28], df.index[20])
+        msg = sc._build_signal_msg("SELL", "5m", df.index[24], sig.iloc[24], df.iloc[24], df.index[20])
         assert "BSL-01" in msg, f"default SELL must name the fresh BSL pool:\n{msg}"
         assert "@ 120.00" in msg, msg
         assert "actual HIGH" in msg, msg
         assert "Chart Anchor (Swing High): 2026-08-01 10:55 IST" in msg
-        assert sc._level_of("SELL", sig.iloc[28]) == 120.0
+        assert sc._level_of("SELL", sig.iloc[24]) == 120.0
 
-        msg = sc._build_signal_msg("BUY", "5m", df.index[33], sig.iloc[33], df.iloc[33], df.index[25])
+        msg = sc._build_signal_msg("BUY", "5m", df.index[29], sig.iloc[29], df.iloc[29], df.index[25])
         assert "SSL-01" in msg, f"default BUY must name the fresh SSL pool:\n{msg}"
         assert "@ 70.00" in msg, msg
         assert "actual LOW" in msg, msg
         assert "Chart Anchor (Swing Low): 2026-08-01 11:20 IST" in msg
-        assert sc._level_of("BUY", sig.iloc[33]) == 70.0
+        assert sc._level_of("BUY", sig.iloc[29]) == 70.0
 
         # ---- magnet mapping: BSL -> BUY, SSL -> SELL --------------------
         pm = BSLSSLParams(sig_dir="BSL→BUY · SSL→SELL")
         sigm = compute_signals(df, pm)
         scm = _scanner_for(pm, state)
 
-        msg = scm._build_signal_msg("BUY", "5m", df.index[28], sigm.iloc[28], df.iloc[28], df.index[20])
+        msg = scm._build_signal_msg("BUY", "5m", df.index[24], sigm.iloc[24], df.iloc[24], df.index[20])
         assert "BSL-01" in msg, f"magnet BUY must name the fresh BSL pool:\n{msg}"
         assert "@ 120.00" in msg, msg
         assert "actual HIGH" in msg, msg
         assert "pool start @ —" not in msg, "magnet BUY lost its pool level"
-        assert scm._level_of("BUY", sigm.iloc[28]) == 120.0, "magnet BUY dedupe level"
+        assert scm._level_of("BUY", sigm.iloc[24]) == 120.0, "magnet BUY dedupe level"
 
-        msg = scm._build_signal_msg("SELL", "5m", df.index[33], sigm.iloc[33], df.iloc[33], df.index[25])
+        msg = scm._build_signal_msg("SELL", "5m", df.index[29], sigm.iloc[29], df.iloc[29], df.index[25])
         assert "SSL-01" in msg, f"magnet SELL must name the fresh SSL pool:\n{msg}"
         assert "@ 70.00" in msg, msg
         assert "actual LOW" in msg, msg
-        assert scm._level_of("SELL", sigm.iloc[33]) == 70.0, "magnet SELL dedupe level"
+        assert scm._level_of("SELL", sigm.iloc[29]) == 70.0, "magnet SELL dedupe level"
 
     print("  ok  signal message + dedupe level follow the pool mapping")
 
@@ -283,7 +307,7 @@ def test_webhook_formatter():
     map to the right alert kind, a stable dedupe key, and a formatted message."""
     base = {
         "symbol": "NSE:NIFTY", "tf": "5m",
-        "bar_time": "2026-09-01 10:25", "swing_bar_time": "2026-09-01 09:45",
+        "bar_time": "2026-09-01 10:05", "swing_bar_time": "2026-09-01 09:45",
         "pool": "SSL-06", "pool_lvl": 24189.27, "entry": 24228.74,
         "sl": 24156.67, "tp": 24372.88, "target": 24411.91,
     }
@@ -291,16 +315,25 @@ def test_webhook_formatter():
     # --- standard BUY ---
     kind, key, msg = WebhookFormatter.format_payload({**base, "action": "BUY"})
     assert kind == "BUY", kind
-    assert key == "NSE:NIFTY|5m|BUY|2026-09-01 10:25|24189.27", key
+    assert key == "TRADINGVIEW|NSE:NIFTY|5m|BUY|2026-09-01 10:05|24189.27", key
     assert "🟢 BUY SIGNAL — NSE:NIFTY (5m) · STANDARD" in msg, msg
     assert "SSL-06" in msg and "24,189.27" in msg
     assert "Chart Anchor (Swing Low): 2026-09-01 09:45 IST" in msg, msg
-    assert "Swing confirmed 8 bars after actual LOW" in msg, msg
+    assert "Swing confirmed 4 bars after actual LOW" in msg, msg
+
+    # Magnet BUY comes from BSL, therefore its anchor is HIGH.
+    magnet = {**base, "action": "BUY", "pool": "BSL-06", "pool_side": "BSL",
+              "target": 24189.27}
+    kind, _, magnet_msg = WebhookFormatter.format_payload(magnet)
+    assert kind == "BUY"
+    assert "Chart Anchor (Swing High)" in magnet_msg
+    assert "Swing confirmed 4 bars after actual HIGH" in magnet_msg
+    assert "Target pool: 24,189.27" in magnet_msg
 
     # --- fast BUY (TIER 2) ---
     kind, key, msg = WebhookFormatter.format_payload({**base, "action": "BUY", "speed": "fast"})
     assert kind == "FAST_BUY", kind
-    assert "· FAST" in msg and "62% faster" in msg, msg
+    assert "· FAST" in msg and "25% faster" in msg, msg
 
     # --- instant BUY (TIER 1) ---
     kind, key, msg = WebhookFormatter.format_payload(
@@ -309,7 +342,9 @@ def test_webhook_formatter():
     assert "⚡ INSTANT SWEEP BUY" in msg and "(wick)" in msg, msg
 
     # --- standard SELL ---
-    kind, key, msg = WebhookFormatter.format_payload({**base, "action": "SELL"})
+    kind, key, msg = WebhookFormatter.format_payload(
+        {**base, "action": "SELL", "pool": "BSL-06", "pool_side": "BSL"}
+    )
     assert kind == "SELL", kind
     assert "🔴 SELL SIGNAL" in msg and "Chart Anchor (Swing High)" in msg, msg
 
@@ -328,13 +363,13 @@ def test_webhook_formatter():
     # --- plaintext alert ---
     kind, key, msg = WebhookFormatter.format_payload("raw plain alert text")
     assert kind == "PLAINTEXT" and msg == "raw plain alert text"
-    assert key.startswith("NSE:NIFTY|PLAINTEXT|"), key
+    assert key.startswith("TRADINGVIEW|NSE:NIFTY|PLAINTEXT|"), key
 
     # --- unknown JSON falls back to a stable digest key (no randomised hash) ---
     kind, key, msg = WebhookFormatter.format_payload({"foo": "bar"})
     assert kind == "GENERIC", kind
     parts = key.split("|")
-    assert parts[2] == "GENERIC" and len(parts[-1]) == 16, \
+    assert parts[3] == "GENERIC" and len(parts[-1]) == 16, \
         f"generic key must end in a 16-char sha256 digest: {key}"
     _, key2, _ = WebhookFormatter.format_payload({"foo": "bar"})
     assert key == key2, "generic key must be stable across calls"
@@ -366,7 +401,38 @@ def test_state_dedupe():
         # marking as sent blocks re-queueing
         s3.add_pending("k2", "hello", "2026-08-31T14:37:00+05:30")
         assert "k2" not in s3.pending
-    print("  ok  persistent dedupe across restarts")
+
+        relation = s3.record_source_event(
+            "NSE:NIFTY|5m|BUY|2026-08-31 14:35", "TRADINGVIEW",
+            {"pool_lvl": 24300.0, "entry": 24310.0, "sl": 24290.0, "tp": 24350.0},
+        )
+        assert relation["status"] == "new"
+        relation = s3.record_source_event(
+            "NSE:NIFTY|5m|BUY|2026-08-31 14:35", "YAHOO",
+            {"pool_lvl": 24300.0, "entry": 24310.0, "sl": 24290.0, "tp": 24350.0},
+        )
+        assert relation["status"] == "confirmed"
+        relation = s3.record_source_event(
+            "NSE:NIFTY|5m|BUY|2026-08-31 14:35", "YAHOO",
+            {"pool_lvl": 24300.0, "entry": 24311.0, "sl": 24290.0, "tp": 24350.0},
+        )
+        assert relation["status"] == "same_source"
+        s3.persist()
+        s4 = SentState(path)
+        assert "NSE:NIFTY|5m|BUY|2026-08-31 14:35" in s4.source_events
+
+        # Two long-lived source processes must merge rather than overwrite
+        # each other's sent keys when they persist the shared ledger.
+        s5, s6 = SentState(path), SentState(path)
+        assert s5.claim("concurrent-a")
+        s5.mark("concurrent-a")
+        s5.persist()
+        assert s6.claim("concurrent-b")
+        s6.mark("concurrent-b")
+        s6.persist()
+        s7 = SentState(path)
+        assert s7.already_sent("concurrent-a") and s7.already_sent("concurrent-b")
+    print("  ok  persistent dedupe + cross-source correlation")
 
 
 def test_yfinance_column_normalization():
@@ -444,8 +510,8 @@ def test_expiry():
     p = BSLSSLParams(pool_expiry=100)
     _spike(df, 135, high=140.0, close=125.0)        # NEW pivot
     sig2 = compute_signals(df, p)
-    assert bool(sig2["sell_sig"].iloc[143]), "after expiry the old pool is gone -> new pool signals"
-    assert sig2["new_bsl_name"].iloc[143] == "BSL-02"
+    assert bool(sig2["sell_sig"].iloc[139]), "after expiry the old pool is gone -> new pool signals"
+    assert sig2["new_bsl_name"].iloc[139] == "BSL-02"
     print("  ok  pool expiry frees the slot for a new pool")
 
 
@@ -582,6 +648,7 @@ def main():
     test_sweep()
     test_magnet_mapping()
     test_fast_tier_signals()
+    test_fast_magnet_target_uses_standard_book()
     test_instant_sweep_tier()
     test_signal_message_pool_mapping()
     test_expiry()

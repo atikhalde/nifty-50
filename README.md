@@ -1,7 +1,7 @@
-# BSL/SSL Liquidity Scanner — NSE:NIFTY (Zero Delay & 100% Chart Parity)
+# BSL/SSL Liquidity Scanner — NSE:NIFTY (High-Accuracy Chart Parity)
 
 A high-precision Python scanner and Webhook receiver that replicates the TradingView Pine indicator
-**"BSL / SSL Liquidity Start Signals — v5 LITE"** (`abcd.txt` in this repo) **100% 1:1**, scans **only the NSE:NIFTY index** (`^NSEI` via yfinance or direct TradingView webhook) on **1m & 5m** charts, and sends the **exact same BUY/SELL/Sweep signals** to **two Telegram bots** simultaneously.
+**"BSL / SSL Liquidity Start Signals — v5 LITE"** (`abcd.txt` in this repo) with a canonical payload shared by the chart, webhook, and Yahoo comparison paths, scans **only the NSE:NIFTY index** (`^NSEI` via yfinance or direct TradingView webhook) on **1m & 5m** charts, and sends the **exact same BUY/SELL/Sweep signals** to **two Telegram bots** simultaneously.
 
 ---
 
@@ -10,9 +10,9 @@ A high-precision Python scanner and Webhook receiver that replicates the Trading
 | Feature | TradingView Pine Script (`abcd.txt`) | Scanner Python Engine (`scanner/`) |
 |---|---|---|
 | **ATR** | `ta.atr(14)` (Wilder RMA of True Range) | Exact `_wilders_rma` with $\alpha = 1/14$ |
-| **Pivot Detection** | `ta.pivothigh(high, 8, 8)` / `ta.pivotlow(low, 8, 8)` | Strict pivot confirmed **8 bars later** (non-repainting) |
-| **Multi-Speed TIER 3** | Standard `pivLen=8` labels + webhook | Original intact swing, macro `nextBSL`/`nextSSL` target tracking |
-| **Multi-Speed TIER 2** | Fast `fastPivLen=3` labels + webhook (15m on 5m, 3m on 1m) | 62% faster entries, same ATR SL/TP, still aims at standard pools |
+| **Pivot Detection** | `ta.pivothigh(high, 4, 4)` / `ta.pivotlow(low, 4, 4)` | Strict pivot confirmed **4 bars later** (non-repainting) |
+| **Multi-Speed TIER 3** | Standard `pivLen=4` labels + webhook | Original intact swing, macro `nextBSL`/`nextSSL` target tracking |
+| **Multi-Speed TIER 2** | Fast `fastPivLen=3` labels + webhook (15m on 5m, 3m on 1m) | 25% faster than the 4-bar default, same ATR SL/TP, still aims at standard pools |
 | **Multi-Speed TIER 1** | Instant sweep labels on the sweep candle (0-bar lag) | Wick SL + 1:2 R:R TP, executed on sweep close |
 | **Pool Creation** | Fresh swing high $\rightarrow$ BSL, Fresh swing low $\rightarrow$ SSL | Identical; equal swings within `eqTol` merge into existing pool without firing a signal |
 | **Pool Lifecycle** | Sweep (`high > lvl && close < lvl` / `low < lvl && close > lvl`), Touch, Expiry (300 bars), Max 12 pools/side | Same order per bar: create $\rightarrow$ sweep $\rightarrow$ touch $\rightarrow$ expiry $\rightarrow$ signal |
@@ -26,8 +26,12 @@ A high-precision Python scanner and Webhook receiver that replicates the Trading
 
 ### Mode 1: Zero-Delay Direct TradingView Webhook (Recommended)
 TradingView alerts send webhook requests instantly to the scanner when a bar closes.
+TradingView and Yahoo alerts are source-tagged separately. Both may deliver an alert, while the persisted `source_events` ledger marks matching events as confirmed and exposes numeric conflicts instead of silently merging them.
 - 0 second delay (instant alerts)
-- Exact TradingView price matching
+- Exact TradingView price matching for webhook-originated alerts; Yahoo remains feed-dependent
+- In TradingView, create the alert with **Condition → Any alert() function call** and
+  `Once Per Bar Close` to receive the rich JSON payload. The named `alertcondition`
+  entries are lightweight manual conditions and do not carry the numeric JSON fields.
 ```bash
 python run_scanner.py --webhook
 ```
@@ -37,6 +41,11 @@ Continuously polls Yahoo Finance for newly closed 1m/5m bars during NSE hours (0
 ```bash
 python run_scanner.py
 ```
+
+To operate both feeds, run the webhook listener and the live scanner as
+separate processes with the same `STATE_FILE`. The persistent ledger uses a
+file lock and merges sent keys/correlation events, so the sources can alert
+independently without overwriting each other.
 
 ### Mode 3: GitHub Actions Cloud Runner
 Runs periodically via scheduled workflow in `.github/workflows/scanner.yml` with state persistence.
@@ -55,8 +64,9 @@ python run_scanner.py --lookback 20
 💵 Entry: 24,228.74 (Closed Confirmation Bar)
 🛑 SL: 24,156.67  ·  🎯 TP: 24,372.88 (1:2 R:R)
 🎯 Nearest pool: 24,411.91
-📍 Chart Anchor (Swing Low): 2026-09-01 07:55 IST
-⚡ Swing confirmed 8 bars after actual LOW (non-repainting)
+📍 Chart Anchor (Swing Low): 2026-09-01 08:15 IST
+⚡ Swing confirmed 4 bars after actual LOW (non-repainting)
+🕒 Execution Bar: 2026-09-01 08:35 IST
 Bar: 2026-09-01 08:35 IST
 ```
 
@@ -67,15 +77,18 @@ Bar: 2026-09-01 08:35 IST
 💵 Entry: 24,352.86 (Closed Confirmation Bar)
 🛑 SL: 24,435.13  ·  🎯 TP: 24,188.31 (1:2 R:R)
 🎯 Nearest pool: 24,164.77
-📍 Chart Anchor (Swing High): 2026-09-01 02:20 IST
-⚡ Swing confirmed 8 bars after actual HIGH (non-repainting)
+📍 Chart Anchor (Swing High): 2026-09-01 02:40 IST
+⚡ Swing confirmed 4 bars after actual HIGH (non-repainting)
+🕒 Execution Bar: 2026-09-01 03:00 IST
 Bar: 2026-09-01 03:00 IST
 ```
 
 ### Strict no-duplicate guarantee
-Every alert gets a unique key (`symbol|tf|kind|bar-time|level`) persisted to
-`data/sent_alerts.json`. A signal is sent **exactly once** — never repeated,
-even across scanner restarts. Failed deliveries are retried until delivered.
+Every alert gets a source-specific unique key (`source|symbol|tf|kind|bar-time|level`) persisted to
+`data/sent_alerts.json`. A signal is sent **exactly once per source** — never repeated
+by that source, even across scanner restarts. The `source_events` ledger correlates
+TradingView and Yahoo alerts and marks matching values as confirmed or conflicting.
+Failed deliveries are retried until delivered.
 
 ---
 
@@ -92,8 +105,9 @@ even across scanner restarts. Failed deliveries are retried until delivered.
 | `MAX_ALERT_AGE_MIN` | `10` | never alert on closed bars older than this (live mode; 0 = off) |
 | `PENDING_MAX_AGE_MIN` | `30` | retry failed Telegram deliveries this long, then drop |
 | `WEBHOOK_HOST` / `WEBHOOK_PORT` / `WEBHOOK_SECRET` | `0.0.0.0` / `5000` / — | webhook receiver binding + shared secret |
-| `PIV_LEN` | `8` | swing pivot strength (bars each side) |
-| `ATR_LEN` | `14` | ATR period |
+| `PIV_LEN` | `4` | swing pivot strength (bars each side); signal fires 4 bars after swing |
+| `ALERT_SOURCE` | `YAHOO` | source tag for the live path; webhook is always `TRADINGVIEW` |
+| `ATR_LEN` | fixed `14` | Pine uses `ta.atr(14)`; not a configurable chart input |
 | `ZONE_ATR_MULT` | `0.25` | zone thickness × ATR |
 | `EQ_TOL_ATR` | `0.15` | equal H/L merge tolerance × ATR |
 | `MAX_POOLS` | `12` | max live pools per side |
@@ -141,8 +155,9 @@ SESSION_END=15:30
 TZ=Asia/Kolkata
 
 # Indicator Settings
-PIV_LEN=8
-ATR_LEN=14
+PIV_LEN=4
+ALERT_SOURCE=YAHOO
+# ATR is fixed at 14 to match ta.atr(14)
 ZONE_ATR_MULT=0.25
 EQ_TOL_ATR=0.15
 MAX_POOLS=12
