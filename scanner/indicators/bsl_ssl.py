@@ -2,7 +2,9 @@
 
     "BSL / SSL Liquidity Start Signals — v5 LITE"   (see abcd.txt at repo root)
 
-Signal logic replicated 1:1 with the Pine script, plus a 3-tier Multi-Speed overlay:
+Signal logic follows the canonical Pine script, plus a 3-tier Multi-Speed overlay. Exact
+numeric parity still requires the same OHLC history; Yahoo-vs-TradingView differences
+are recorded by the source correlation ledger:
 
   * ATR      -> ta.atr(14)  (Wilder RMA of True Range)
   * Pivots   -> ta.pivothigh(high, pivLen, pivLen) / ta.pivotlow(low, pivLen, pivLen).
@@ -20,8 +22,8 @@ Signal logic replicated 1:1 with the Pine script, plus a 3-tier Multi-Speed over
   * SL / TP  -> sl = close -/+ atr*atr_sl ; tp = close -/+ atr*atr_sl*rr_target
 
   Multi-Speed tiers (all three can fire independently on the same tape):
-  * TIER 3 STANDARD  piv_len=8  — original non-repainting swing, macro target tracking
-  * TIER 2 FAST      fast_piv_len=3  — 62% faster entries (15m on 5m, 3m on 1m)
+  * TIER 3 STANDARD  piv_len=4  — original non-repainting swing, macro target tracking
+  * TIER 2 FAST      fast_piv_len=3  — 25% faster than the 4-bar default (15m on 5m, 3m on 1m)
   * TIER 1 INSTANT   0-bar lag on sweep candle close — wick SL, 1:2 R:R TP
 
 The per-bar order of operations matches the script exactly:
@@ -45,8 +47,8 @@ import pandas as pd
 
 @dataclass
 class BSLSSLParams:
-    piv_len: int = 8              # TIER 3 "Swing pivot strength" (bars left+right)
-    fast_piv_len: int = 3         # TIER 2 fast swing (15m on 5m, 3m on 1m) — 62% faster
+    piv_len: int = 4              # TIER 3 "Swing pivot strength" (4 bars left + 4 right)
+    fast_piv_len: int = 3         # TIER 2 fast swing (15m on 5m, 3m on 1m) — 25% faster than the 4-bar default
     atr_len: int = 14             # ta.atr length
     zone_atr_mult: float = 0.25   # "Zone thickness (x ATR)"
     eq_tol_atr: float = 0.15      # "Equal H/L tolerance (x ATR)"
@@ -86,9 +88,11 @@ class BSLSSLParams:
             return v.strip().lower() in ("1", "true", "yes", "on")
 
         return cls(
+            # Pine's ATR is intentionally fixed at 14; ATR_LEN is not a Pine
+            # input and must not create a silent parity fork.
             piv_len=_get("PIV_LEN", cls.piv_len, int),
             fast_piv_len=_get("FAST_PIV_LEN", cls.fast_piv_len, int),
-            atr_len=_get("ATR_LEN", cls.atr_len, int),
+            atr_len=14,
             zone_atr_mult=_get("ZONE_ATR_MULT", cls.zone_atr_mult, float),
             eq_tol_atr=_get("EQ_TOL_ATR", cls.eq_tol_atr, float),
             max_pools=_get("MAX_POOLS", cls.max_pools, int),
@@ -384,9 +388,9 @@ def compute_signals(df: pd.DataFrame, p: BSLSSLParams | None = None) -> pd.DataF
         tp_short = close[j] - a * p.atr_sl * p.rr_target
 
         # ------------------------------------------------------------
-        # TIER 2 — FAST SWING PIVOTS (fast_piv_len = 3 → 62% faster)
+        # TIER 2 — FAST SWING PIVOTS (fast_piv_len = 3 → 25% faster by default)
         # Independent confirmation; macro targets still come from the
-        # intact piv_len=8 pool book (next_bsl / next_ssl).
+        # intact piv_len=4 pool book (next_bsl / next_ssl).
         # ------------------------------------------------------------
         fast_bsl_start = False
         fast_ssl_start = False

@@ -159,6 +159,12 @@ class YFinanceFeed:
                     threads=False,
                 )
                 df = self._normalise(raw)
+                # Keep only bars that TradingView can see in the regular NSE
+                # session. Yahoo normally does this for the index, but the
+                # explicit filter prevents a provider/config change from
+                # introducing out-of-session bars into the pivot history.
+                if df is not None and interval != "1d":
+                    df = self._session_filter(df)
                 if df is None or df.empty:
                     raise FeedError(f"empty frame for {self.symbol} {interval}/"
                                     f"{f'start={start}' if start else period}")
@@ -226,6 +232,20 @@ class YFinanceFeed:
         return df
 
     # ------------------------------------------------------------------
+    def _session_filter(self, df):
+        """Apply the regular NSE window using exchange-local timestamps."""
+        from datetime import time as dtime
+        try:
+            start = dtime.fromisoformat(str(self.session_start).strip())
+            end = dtime.fromisoformat(str(self.session_end).strip())
+        except ValueError:
+            log.warning("Invalid feed session %r-%r; leaving bars unchanged",
+                        self.session_start, self.session_end)
+            return df
+        mask = (df.index.time >= start) & (df.index.time < end)
+        return df.loc[mask]
+
+    # ------------------------------------------------------------------
     def _check_staleness(self, interval: str, df) -> None:
         """Warn (loudly) if the newest bar stops advancing during the session."""
         newest = df.index[-1]
@@ -252,4 +272,4 @@ class YFinanceFeed:
             end = dtime.fromisoformat(self.session_end)
         except ValueError:
             return True
-        return start <= now.time() <= end
+        return start <= now.time() < end
